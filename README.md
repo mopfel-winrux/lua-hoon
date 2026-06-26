@@ -141,18 +141,28 @@ yield-free loop body inside a coroutine keeps tree-walker speed.
 ## Performance
 
 Tree-walking interpreter over a functional store, interpreted through Nock — so
-expect scripting speeds, not LuaJIT. Measured on a fakeship (vere 3.2):
+expect scripting speeds, not LuaJIT. Timed with the runtime's own `~> %bout`
+hint on a fakeship (vere 3.2), wrapping `(run:lua src)`:
 
-| workload                         | cost                          |
-|----------------------------------|-------------------------------|
-| simple loop iteration            | ~38 µs (~26k/s), flat at scale |
-| trivial function call            | ~15 µs                        |
-| heavy recursive call (`fib`)     | ~140 µs                       |
-| table set                        | ~20 µs                        |
+| benchmark                          |      work | wall time | per unit   |
+|------------------------------------|----------:|----------:|------------|
+| lex + parse + stdlib setup         |         — |   0.43 ms | fixed start |
+| `s = s + i` loop                   | 1,000,000 |   35.5 s  | ~35 µs/iter |
+| Ackermann `A(3,5)`                 |    42,438 |    3.42 s | ~81 µs/call |
+| Ackermann `A(3,6)`                 |   172,233 |   14.1 s  | ~82 µs/call |
+| Ackermann `A(3,7)`                 |   693,964 |   57.4 s  | ~83 µs/call |
+| naive recursive `fib(25)`          |   242,785 |   34.2 s  | ~141 µs/call |
 
-Loops and call-heavy code run in bounded memory (a call that creates no closures
-or tables reclaims its cells on return), so a 100k-iteration loop or hundreds of
-thousands of calls scale linearly without exhausting the loom.
+("work" = loop iterations, or the exact number of function calls made.)
+
+The Ackermann rows are the interesting ones: per-call cost stays flat (~82 µs)
+from 10k to 700k calls. That's the point — a call that creates no closures or
+tables reclaims its cells on return, so deep/wide recursion runs in **bounded
+memory** and scales linearly instead of growing the store until the loom is
+exhausted. The same holds for loops (flat from 10⁵ to 10⁶ iterations).
+
+See [`examples/`](examples) for runnable programs, including `ackermann.lua` and
+an infinite coroutine prime generator (`primes.lua`).
 
 ## Implementation note: recursive types
 
