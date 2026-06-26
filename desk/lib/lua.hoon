@@ -3,7 +3,13 @@
 ::    a hand-written lexer + recursive-descent parser + tree-walking
 ::    interpreter.  numbers are int (@sd) or float (@rd) per Lua 5.4.
 ::    tables and variables are mutable via a shared store keyed by id;
-::    closures capture lexical scope so upvalues work.
+::    closures capture lexical scope so upvalues work; metatables drive
+::    operator/index overloading.
+::
+::    coroutines need true suspension, which a recursive tree-walker can't
+::    give, so a coroutine body runs instead on a small CEK step machine
+::    (see the "CEK machine" sections) whose continuation is reified as a
+::    flat list and parked on yield.  the two evaluators share every leaf arm.
 ::
 ::    public arm:  (run src=@t) -> (list tape)   :: stdout lines
 ::
@@ -1825,30 +1831,23 @@
   ^-  mstate
   ?>  ?=(%ee -.c.m)
   =/  e  ;;(expr e.c.m)
+  ::  a subtree with no call can't suspend: evaluate it atomically (fast path).
   ?.  (expr-has-call e)
     =^  v  s.m  (ev e env.m va.m s.m)
     m(c [%rv ~[v]])
-  ?-  -.e
+  ::  only call-containing compounds reach here; everything else hit the
+  ::  fast path above, so the default just delegates to the tree-walker.
+  ?+  -.e  =^(v s.m (ev e env.m va.m s.m) m(c [%rv ~[v]]))
     %paren   m(c [%ee e.e])
     %call    m(c [%em e])
     %method  m(c [%em e])
     %index   m(c [%ee t.e], k [[%ik k.e] k.m])
     %unop    m(c [%ee e.e], k [[%un op.e] k.m])
+    %table   ~|(%lua-yield-in-table-unsupported !!)
   ::
       %binop
     ?:  ?|(=(op.e 'and') =(op.e 'or'))  m(c [%ee l.e], k [[%sc op.e r.e] k.m])
     m(c [%ee l.e], k [[%br op.e r.e] k.m])
-  ::
-      %table  ~|(%lua-yield-in-table-unsupported !!)
-      %nil    m(c [%rv ~[[%nil ~]]])
-      %true   m(c [%rv ~[[%b %.y]]])
-      %false  m(c [%rv ~[[%b %.n]]])
-      %int    m(c [%rv ~[[%i p.e]]])
-      %flt    m(c [%rv ~[[%f p.e]]])
-      %str    m(c [%rv ~[[%s p.e]]])
-      %name   m(c [%rv ~[(rd-var p.e env.m s.m)]])
-      %vararg  m(c [%rv va.m])
-      %func   =^(v s.m (ev e env.m va.m s.m) m(c [%rv ~[v]]))
   ==
 ::  eval expr to a value LIST (call/method expand; vararg)
 ++  step-em
