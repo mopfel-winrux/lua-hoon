@@ -21,6 +21,7 @@ desk/
   lib/lua.hoon    -- the interpreter (lexer + parser + evaluator)
   mar/lua.hoon    -- a %lua source mark, for storing .lua files in Clay
   gen/lua.hoon    -- the `+lua` generator: run a Lua string and print stdout
+  ted/lua.hoon    -- a spider thread: run a Lua program that can do Urbit IO
   sys.kelvin      -- [%zuse 408]
 examples/         -- sample Lua programs
 ```
@@ -55,6 +56,38 @@ desk instead, so `+lua` runs live with no desk pinning:
 
 `run:lua` is the library entrypoint: `(run:lua src=@t)` parses and evaluates a
 Lua source cord and returns its stdout as a `(list tape)`.
+
+## Threads: a Lua program that does Urbit IO
+
+`/ted/lua.hoon` runs a Lua program as a [spider](https://docs.urbit.org/build-on-urbit/threads)
+thread — and the program can perform real Urbit effects, written in Lua:
+
+```dojo
+> -lua 'sys.flog("counting down...") for i=3,1,-1 do sys.flog(i.."...") sys.wait(1000) end return "liftoff at "..sys.now()'
+counting down...
+3...
+2...                  (one real second passes between each line)
+1...
+[~zod ...]            <- the thread result: "liftoff at <time>"
+```
+
+The `sys` table exposes strand effects:
+
+| Lua call        | effect |
+|-----------------|--------|
+| `sys.wait(ms)`  | sleep `ms` milliseconds on the timer (behn) vane |
+| `sys.flog(s)`   | print a line to the dojo, live |
+| `sys.now()`     | read the current time (`@da`) back into Lua |
+
+This is the coroutine machinery doing real work. The whole program runs as one
+coroutine; each `sys.*` call is `coroutine.yield(tag, …)`, which **suspends the
+interpreter from any depth** (here, inside a `for` loop) and hands an effect
+request to the Hoon strand. The strand performs it with `strandio`, then
+**resumes the program with the result** — so `sys.now()` returns a value that
+flowed back in from the runtime, and `sys.wait` genuinely parks the Lua program
+across a timer event. Adding more effects (`scry`, `poke`, …) is a new `sys.*`
+line in the prelude plus a branch in the strand driver. A pure program that
+never calls `sys.*` just runs to completion and returns its stdout.
 
 ## Supported language
 

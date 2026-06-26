@@ -161,6 +161,12 @@
   ==
 +$  kont    (list kframe)
 +$  mstate  $:(c=ctrl k=kont env=scope va=(list value) s=store)
+::    result of stepping a program run as a thread (see ++thread-step):
+::    %done = the program returned; %yield = it called an effect builtin.
++$  tres
+  $%  [%done vals=(list value) out=(list tape)]
+      [%yield tag=@t args=(list value) out=(list tape)]
+  ==
 ::                                                ::  ::  char predicates
 ++  dig  |=(c=@ &((gte c '0') (lte c '9')))
 ++  hek
@@ -2752,6 +2758,47 @@
   =/  s  (setup init-store)
   =/  res  (do-stmts ;;((list stmt) ast) ~[~] ~ s)
   out:+.res
+::                                                ::  ::  thread driver
+::    Run a Lua program as a resumable coroutine so it can drive Urbit IO.
+::    Effect builtins (the `sys` table) call coroutine.yield(tag, args...);
+::    a Hoon strand performs the effect and resumes with the result.
+++  prelude
+  ^-  @t
+  %+  rap  3
+  :~  'sys={} '
+      'function sys.wait(ms) return coroutine.yield("wait",ms) end '
+      'function sys.flog(s) return coroutine.yield("flog",s) end '
+      'function sys.now() return coroutine.yield("now") end '
+  ==
+++  thread-init
+  |=  src=@t
+  ^-  [coid=@ud s=store]
+  =/  ast  (parse (lex (trip (cat 3 prelude src))))
+  =/  s  (setup init-store)
+  =^  fid  s  (fresh s)
+  =.  funs.s  (~(put by funs.s) fid [~ %.n ;;((list stmt) ast) ~])
+  =^  cid  s  (fresh s)
+  =.  coros.s  (~(put by coros.s) cid [[%c fid] %susp %.n ~ ~ ~])
+  [cid s]
+++  thread-step
+  |=  [coid=@ud in=(list value) s=store]
+  ^-  [tres store]
+  =^  rv  s  (do-resume [[%co coid] in] s)
+  =/  co  (~(got by coros.s) coid)
+  =/  vals  (slag 1 rv)
+  ?:  ?=(%dead status.co)  [[%done vals out.s] s]
+  =/  tag  ?~(vals '' (vcord i.vals))
+  [[%yield tag ?~(vals ~ t.vals) out.s] s]
+++  vcord
+  |=  v=value
+  ^-  @t
+  ?:  ?=(%s -.v)  p.v
+  ?:  ?=(%i -.v)  (crip (fmt-int p.v))
+  (crip (tostr v *store))
+++  vnum
+  |=  v=value
+  ^-  @
+  ?:(?=(%i -.v) (abs:si p.v) 0)
 --
 
 ::  marker
