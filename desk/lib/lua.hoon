@@ -94,6 +94,7 @@
       tabs=(map @ud ltable)
       funs=(map @ud closure)
       glob=(map @t value)
+      metas=(map @ud @ud)
       next=@ud
       out=(list tape)
   ==
@@ -754,7 +755,7 @@
   =/  vr  (parse-expr q)
   [[%pos p.vr] q.vr]
 ::                                                ::  ::  store helpers
-++  init-store  ^-(store [~ ~ ~ ~ 0 ~])
+++  init-store  ^-(store [~ ~ ~ ~ ~ 0 ~])
 ++  fresh
   |=  s=store
   ^-  [@ud store]
@@ -965,6 +966,121 @@
     %c    (weld "function: " (scow %ux id.v))
     %fn   (weld "builtin: " (trip p.v))
   ==
+::                                                ::  ::  metamethods
+++  mm-lookup
+  |=  [v=value name=@t s=store]
+  ^-  value
+  ?.  ?=(%t -.v)  [%nil ~]
+  =/  mid  (~(get by metas.s) id.v)
+  ?~  mid  [%nil ~]
+  (tab-get u.mid [%s name] s)
+++  bin-mm
+  |=  [name=@t a=value b=value s=store]
+  ^-  (unit value)
+  =/  h  (mm-lookup a name s)
+  ?.  ?=(%nil -.h)  `h
+  =/  h2  (mm-lookup b name s)
+  ?.  ?=(%nil -.h2)  `h2
+  ~
+++  arith-mm-name
+  |=  op=@t
+  ^-  @t
+  ?:  =(op '+')   '__add'
+  ?:  =(op '-')   '__sub'
+  ?:  =(op '*')   '__mul'
+  ?:  =(op '/')   '__div'
+  ?:  =(op '%')   '__mod'
+  ?:  =(op '^')   '__pow'
+  ?:  =(op '//')  '__idiv'
+  '__add'
+++  index-get
+  |=  [tv=value k=value s=store]
+  ^-  [value store]
+  ?.  ?=(%t -.tv)  ~|([%lua-index-non-table -.tv] !!)
+  =/  raw  (tab-get id.tv k s)
+  ?.  ?=(%nil -.raw)  [raw s]
+  =/  mid  (~(get by metas.s) id.tv)
+  ?~  mid  [[%nil ~] s]
+  =/  h  (tab-get u.mid [%s '__index'] s)
+  ?:  ?=(%nil -.h)  [[%nil ~] s]
+  ?:  ?=(%t -.h)  (index-get h k s)
+  ?:  ?|(?=(%c -.h) ?=(%fn -.h))
+    =^  rs  s  (apply h ~[tv k] s)
+    [?~(rs [%nil ~] i.rs) s]
+  [[%nil ~] s]
+++  index-set
+  |=  [tv=value k=value v=value s=store]
+  ^-  store
+  ?.  ?=(%t -.tv)  ~|(%lua-assign-index-non-table !!)
+  =/  raw  (tab-get id.tv k s)
+  ?.  ?=(%nil -.raw)  (tab-set id.tv k v s)
+  =/  mid  (~(get by metas.s) id.tv)
+  ?~  mid  (tab-set id.tv k v s)
+  =/  h  (tab-get u.mid [%s '__newindex'] s)
+  ?:  ?=(%nil -.h)  (tab-set id.tv k v s)
+  ?:  ?=(%t -.h)  (index-set h k v s)
+  ?:  ?|(?=(%c -.h) ?=(%fn -.h))
+    =^  rs  s  (apply h ~[tv k v] s)
+    s
+  (tab-set id.tv k v s)
+++  do-arith
+  |=  [op=@t a=value b=value s=store]
+  ^-  [value store]
+  ?:  ?|(?=(%t -.a) ?=(%t -.b))
+    =/  h  (bin-mm (arith-mm-name op) a b s)
+    ?~  h  ~|([%lua-arith-on-non-number op] !!)
+    =^  rs  s  (apply u.h ~[a b] s)
+    [?~(rs [%nil ~] i.rs) s]
+  [(arith op a b) s]
+++  do-concat
+  |=  [a=value b=value s=store]
+  ^-  [value store]
+  ?:  ?|(?=(%t -.a) ?=(%t -.b))
+    =/  h  (bin-mm '__concat' a b s)
+    ?~  h  ~|(%lua-concat-non-string !!)
+    =^  rs  s  (apply u.h ~[a b] s)
+    [?~(rs [%nil ~] i.rs) s]
+  [(concat a b) s]
+++  do-compare
+  |=  [op=@t a=value b=value s=store]
+  ^-  [value store]
+  ?:  ?|(=(op '==') =(op '~='))
+    =/  raw  (val-eq a b)
+    ?:  ?&(!raw ?=(%t -.a) ?=(%t -.b))
+      =/  h  (mm-lookup a '__eq' s)
+      =.  h  ?:(?=(%nil -.h) (mm-lookup b '__eq' s) h)
+      ?:  ?=(%nil -.h)  [[%b ?:(=(op '==') %.n %.y)] s]
+      =^  rs  s  (apply h ~[a b] s)
+      =/  res  (truthy ?~(rs [%nil ~] i.rs))
+      [[%b ?:(=(op '==') res !res)] s]
+    [[%b ?:(=(op '==') raw !raw)] s]
+  ?:  ?|(?=(%t -.a) ?=(%t -.b))
+    =/  le=?    ?|(=(op '<=') =(op '>='))
+    =/  swap=?  ?|(=(op '>') =(op '>='))
+    =/  mm=@t   ?:(le '__le' '__lt')
+    =/  lhs  ?:(swap b a)
+    =/  rhs  ?:(swap a b)
+    =/  h  (bin-mm mm lhs rhs s)
+    ?~  h  ~|([%lua-compare-no-metamethod op] !!)
+    =^  rs  s  (apply u.h ~[lhs rhs] s)
+    [[%b (truthy ?~(rs [%nil ~] i.rs))] s]
+  [(compare op a b) s]
+++  do-tostr
+  |=  [v=value s=store]
+  ^-  [tape store]
+  ?.  ?=(%t -.v)  [(tostr v s) s]
+  =/  h  (mm-lookup v '__tostring' s)
+  ?:  ?=(%nil -.h)  [(tostr v s) s]
+  =^  rs  s  (apply h ~[v] s)
+  =/  r  ?~(rs [%nil ~] i.rs)
+  [(tostr r s) s]
+++  tostr-args
+  |=  [args=(list value) s=store]
+  ^-  [(list tape) store]
+  ?~  args  [~ s]
+  =^  p  s  (do-tostr i.args s)
+  =^  rest  s  $(args t.args)
+  [[p rest] s]
 ::                                                ::  ::  evaluator
 ++  arg
   |=  [n=@ud as=(list value)]
@@ -988,8 +1104,7 @@
       %index
     =^  tv  s  (ev t.e env va s)
     =^  kv  s  (ev k.e env va s)
-    ?.  ?=(%t -.tv)  ~|([%lua-index-non-table -.tv] !!)
-    [(tab-get id.tv kv s) s]
+    (index-get tv kv s)
   ::
       %call
     =^  vs  s  (do-call e env va s)
@@ -1028,12 +1143,12 @@
     (ev r.e env va s)
   =^  l  s  (ev l.e env va s)
   =^  r  s  (ev r.e env va s)
-  ?:  =(op '..')  [(concat l r) s]
+  ?:  =(op '..')  (do-concat l r s)
   ?:  ?|(=(op '==') =(op '~=') =(op '<') =(op '>') =(op '<=') =(op '>='))
-    [(compare op l r) s]
+    (do-compare op l r s)
   ?:  ?|(=(op '&') =(op '|') =(op '~') =(op '<<') =(op '>>'))
     [(bitwise op l r) s]
-  [(arith op l r) s]
+  (do-arith op l r s)
 ++  ev-unop
   |=  [ex=* env=scope va=(list value) s=store]
   ^-  [value store]
@@ -1044,11 +1159,22 @@
   ?:  =(op.e '-')
     ?:  ?=(%i -.v)  [[%i (dif:si --0 p.v)] s]
     ?:  ?=(%f -.v)  [[%f (sub:rd .~0 p.v)] s]
+    ?:  ?=(%t -.v)
+      =/  h  (mm-lookup v '__unm' s)
+      ?.  ?=(%nil -.h)
+        =^  rs  s  (apply h ~[v v] s)
+        [?~(rs [%nil ~] i.rs) s]
+      ~|(%lua-unary-minus-non-number !!)
     ~|(%lua-unary-minus-non-number !!)
   ?:  =(op.e '~')
     [[%i (from-u64 (mix bmask (to-u64 (as-bint v))))] s]
   ?:  ?=(%s -.v)  [[%i (sun:si (lent (trip p.v)))] s]
-  ?:  ?=(%t -.v)  [[%i (tab-len id.v s)] s]
+  ?:  ?=(%t -.v)
+    =/  h  (mm-lookup v '__len' s)
+    ?.  ?=(%nil -.h)
+      =^  rs  s  (apply h ~[v] s)
+      [?~(rs [%nil ~] i.rs) s]
+    [[%i (tab-len id.v s)] s]
   ~|(%lua-length-of-non-table !!)
 ++  evm
   |=  [ex=* env=scope va=(list value) s=store]
@@ -1107,7 +1233,7 @@
   ?:  ?=(%method -.e)
     =^  ov  s  (ev o.e env va s)
     ?.  ?=(%t -.ov)  ~|(%lua-method-on-non-table !!)
-    =/  fnv  (tab-get id.ov [%s m.e] s)
+    =^  fnv  s  (index-get ov [%s m.e] s)
     =^  args  s  (evl args.e env va s)
     (apply fnv [ov args] s)
   ?>  ?=(%call -.e)
@@ -1121,6 +1247,10 @@
     (call-closure (~(got by funs.s) id.fnv) args s)
   ?:  ?=(%fn -.fnv)
     (call-builtin p.fnv args s)
+  ?:  ?=(%t -.fnv)
+    =/  h  (mm-lookup fnv '__call' s)
+    ?:  ?=(%nil -.h)  ~|([%lua-call-non-function -.fnv] !!)
+    (apply h [fnv args] s)
   ~|([%lua-call-non-function -.fnv] !!)
 ++  call-closure
   |=  [cl=closure args=(list value) s=store]
@@ -1286,8 +1416,7 @@
   ?:  ?=(%index -.tgt)
     =^  tv  s  (ev t.tgt env va s)
     =^  kv  s  (ev k.tgt env va s)
-    ?.  ?=(%t -.tv)  ~|(%lua-assign-index-non-table !!)
-    =.  s  (tab-set id.tv kv val s)
+    =.  s  (index-set tv kv val s)
     $(targets t.targets, i +(i))
   ~|(%lua-bad-assign-target !!)
 ++  do-while
@@ -1522,13 +1651,16 @@
   ^-  [(list value) store]
   ?+    nm  ~|([%lua-unknown-builtin nm] !!)
       %print
-    =/  parts  (turn args |=(v=value (tostr v s)))
+    =^  parts  s  (tostr-args args s)
     =/  tab=tape  ~[`@tD`9]
     =/  line  (zing (join tab parts))
     [~ s(out (snoc out.s line))]
   ::
       %type     [~[(bi-type (arg 0 args))] s]
-      %tostring  [~[[%s (crip (tostr (arg 0 args) s))]] s]
+      %tostring
+    =^  t  s  (do-tostr (arg 0 args) s)
+    [~[[%s (crip t)]] s]
+  ::
       %tonumber  [~[(bi-tonumber (arg 0 args))] s]
       %pairs    [~[[%fn %next] (arg 0 args) [%nil ~]] s]
       %ipairs   [~[[%fn %inext] (arg 0 args) [%i --0]] s]
@@ -1536,6 +1668,27 @@
       %rawequal  [~[[%b (val-eq (arg 0 args) (arg 1 args))]] s]
       %rawget    [~[(tab-get id:;;([%t id=@ud] (arg 0 args)) (arg 1 args) s)] s]
       %rawlen    [~[(bi-rawlen (arg 0 args) s)] s]
+  ::
+      %setmetatable
+    =/  tv  (arg 0 args)
+    ?.  ?=(%t -.tv)  ~|(%lua-setmetatable-non-table !!)
+    =/  mv  (arg 1 args)
+    ?:  ?=(%nil -.mv)
+      [~[tv] s(metas (~(del by metas.s) id.tv))]
+    ?.  ?=(%t -.mv)  ~|(%lua-setmetatable-bad-meta !!)
+    [~[tv] s(metas (~(put by metas.s) id.tv id.mv))]
+  ::
+      %getmetatable
+    =/  tv  (arg 0 args)
+    ?.  ?=(%t -.tv)  [~[[%nil ~]] s]
+    =/  mid  (~(get by metas.s) id.tv)
+    ?~  mid  [~[[%nil ~]] s]
+    [~[[%t u.mid]] s]
+  ::
+      %rawset
+    =/  tv  (arg 0 args)
+    ?.  ?=(%t -.tv)  ~|(%lua-rawset-non-table !!)
+    [~[tv] (tab-set id.tv (arg 1 args) (arg 2 args) s)]
   ::
       %inext
     =/  tv  (arg 0 args)
@@ -2025,6 +2178,9 @@
         ['rawget' [%fn %rawget]]
         ['rawequal' [%fn %rawequal]]
         ['rawlen' [%fn %rawlen]]
+        ['rawset' [%fn %rawset]]
+        ['setmetatable' [%fn %setmetatable]]
+        ['getmetatable' [%fn %getmetatable]]
     ==
   =^  mid  s  (new-table s)
   =.  s  (tab-set mid [%s 'floor'] [%fn %mfloor] s)
