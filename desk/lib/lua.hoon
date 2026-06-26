@@ -82,6 +82,18 @@
       [%t id=@ud]
       [%c id=@ud]
       [%fn p=@tas]
+      [%co id=@ud]
+  ==
+::    a coroutine, eager-collect model: at first resume the body runs to
+::    completion with yield() appending to the store's yield buffer; resume
+::    then delivers the buffered yields (then the body's return) one at a time.
++$  coro
+  $:  fun=value             :: body function
+      started=?
+      dead=?
+      vals=(list (list value))  :: buffered yields (each a value list)
+      cur=@ud                   :: how many delivered
+      ret=(list value)          :: body return values
   ==
 +$  vkey  $%([%i p=@sd] [%f p=@rd] [%s p=@t] [%b p=?])
 +$  ltable  (map vkey value)
@@ -95,6 +107,8 @@
       funs=(map @ud closure)
       glob=(map @t value)
       metas=(map @ud @ud)
+      coros=(map @ud coro)
+      ybuf=(unit (list (list value)))
       next=@ud
       out=(list tape)
   ==
@@ -755,7 +769,7 @@
   =/  vr  (parse-expr q)
   [[%pos p.vr] q.vr]
 ::                                                ::  ::  store helpers
-++  init-store  ^-(store [~ ~ ~ ~ ~ 0 ~])
+++  init-store  ^-(store [~ ~ ~ ~ ~ ~ ~ 0 ~])
 ++  fresh
   |=  s=store
   ^-  [@ud store]
@@ -812,6 +826,7 @@
     %t    ~|(%lua-table-key-unsupported !!)
     %c    ~|(%lua-table-key-unsupported !!)
     %fn   ~|(%lua-table-key-unsupported !!)
+    %co   ~|(%lua-table-key-unsupported !!)
   ==
 ++  unkey
   |=  k=vkey
@@ -856,6 +871,7 @@
   ?:  ?&(?=(%nil -.a) ?=(%nil -.b))  %.y
   ?:  ?&(?=(%t -.a) ?=(%t -.b))  =(id.a id.b)
   ?:  ?&(?=(%c -.a) ?=(%c -.b))  =(id.a id.b)
+  ?:  ?&(?=(%co -.a) ?=(%co -.b))  =(id.a id.b)
   ?:  ?&(?=(%fn -.a) ?=(%fn -.b))  =(p.a p.b)
   %.n
 ++  cmp-cord
@@ -965,6 +981,7 @@
     %t    (weld "table: " (scow %ux id.v))
     %c    (weld "function: " (scow %ux id.v))
     %fn   (weld "builtin: " (trip p.v))
+    %co   (weld "thread: " (scow %ux id.v))
   ==
 ::                                                ::  ::  metamethods
 ++  mm-lookup
@@ -1645,11 +1662,65 @@
     %goto  res
     %norm  $(s +.res)
   ==
+::                                                ::  ::  coroutines
+::    eager-collect: run the body to completion at first resume, with yield
+::    appending to ybuf; resume then delivers buffered yields, then the
+::    return values, one resume at a time.
+++  do-resume
+  |=  [coid=@ud args=(list value) s=store]
+  ^-  [(list value) store]
+  =/  co  (~(got by coros.s) coid)
+  ?:  dead.co  [~[[%b %.n] [%s 'cannot resume dead coroutine']] s]
+  ?:  !started.co
+    =/  saved  ybuf.s
+    =.  ybuf.s  `~
+    =^  rv  s  (apply fun.co args s)
+    =/  collected=(list (list value))  ?~(ybuf.s ~ u.ybuf.s)
+    =.  ybuf.s  saved
+    =.  co  co(started %.y, vals collected, ret rv)
+    ?~  collected
+      =.  co  co(dead %.y)
+      =.  coros.s  (~(put by coros.s) coid co)
+      [[[%b %.y] ret.co] s]
+    =.  co  co(cur 1)
+    =.  coros.s  (~(put by coros.s) coid co)
+    [[[%b %.y] i.collected] s]
+  ?:  (lth cur.co (lent vals.co))
+    =/  v  (snag cur.co vals.co)
+    =.  co  co(cur +(cur.co))
+    =.  coros.s  (~(put by coros.s) coid co)
+    [[[%b %.y] v] s]
+  =.  co  co(dead %.y)
+  =.  coros.s  (~(put by coros.s) coid co)
+  [[[%b %.y] ret.co] s]
 ::                                                ::  ::  builtins
 ++  call-builtin
   |=  [nm=@tas args=(list value) s=store]
   ^-  [(list value) store]
   ?+    nm  ~|([%lua-unknown-builtin nm] !!)
+      %cocreate
+    =^  id  s  (fresh s)
+    =.  coros.s  (~(put by coros.s) id [(arg 0 args) %.n %.n ~ 0 ~])
+    [~[[%co id]] s]
+  ::
+      %coresume
+    =/  cov  (arg 0 args)
+    ?.  ?=(%co -.cov)  ~|(%lua-resume-non-coroutine !!)
+    (do-resume id.cov ?~(args ~ t.args) s)
+  ::
+      %coyield
+    ?~  ybuf.s  ~|(%lua-yield-outside-coroutine !!)
+    [~ s(ybuf `(snoc u.ybuf.s args))]
+  ::
+      %costatus
+    =/  cov  (arg 0 args)
+    ?.  ?=(%co -.cov)  ~|(%lua-status-non-coroutine !!)
+    =/  co  (~(got by coros.s) id.cov)
+    [~[[%s ?:(dead.co 'dead' 'suspended')]] s]
+  ::
+      %corunning    [~[[%nil ~] [%b %.y]] s]
+      %coyieldable  [~[[%b ?=(^ ybuf.s)]] s]
+  ::
       %print
     =^  parts  s  (tostr-args args s)
     =/  tab=tape  ~[`@tD`9]
@@ -1749,6 +1820,7 @@
     %t    'table'
     %c    'function'
     %fn   'function'
+    %co   'thread'
   ==
 ++  bi-rawlen
   |=  [v=value s=store]
@@ -2204,6 +2276,14 @@
   =.  s  (tab-set tid [%s 'remove'] [%fn %tremove] s)
   =.  s  (tab-set tid [%s 'concat'] [%fn %tconcat] s)
   =.  glob.s  (~(put by glob.s) 'table' [%t tid])
+  =^  cid  s  (new-table s)
+  =.  s  (tab-set cid [%s 'create'] [%fn %cocreate] s)
+  =.  s  (tab-set cid [%s 'resume'] [%fn %coresume] s)
+  =.  s  (tab-set cid [%s 'yield'] [%fn %coyield] s)
+  =.  s  (tab-set cid [%s 'status'] [%fn %costatus] s)
+  =.  s  (tab-set cid [%s 'running'] [%fn %corunning] s)
+  =.  s  (tab-set cid [%s 'isyieldable'] [%fn %coyieldable] s)
+  =.  glob.s  (~(put by glob.s) 'coroutine' [%t cid])
   s
 ++  run
   |=  src=@t

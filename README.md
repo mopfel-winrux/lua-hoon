@@ -21,7 +21,7 @@ desk/
   lib/lua.hoon    -- the interpreter (lexer + parser + evaluator)
   mar/lua.hoon    -- a %lua source mark, for storing .lua files in Clay
   gen/lua.hoon    -- the `+lua` generator: run a Lua string and print stdout
-  sys.kelvin      -- [%zuse 410]
+  sys.kelvin      -- [%zuse 408]
 examples/         -- sample Lua programs
 ```
 
@@ -60,29 +60,61 @@ Lua source cord and returns its stdout as a `(list tape)`.
 
 - numbers: integers (`@sd`) and floats (`@rd`), with Lua's int/float promotion
   (`+ - *` stay integer; `/` and `^` produce floats; `// %` follow operands)
+- **bitwise operators** `& | ~ << >>` and unary `~` (64-bit two's-complement)
 - strings with escapes, and `..` concatenation; `#` length
 - `nil` / booleans / `and` / `or` / `not` (with short-circuit)
 - locals and globals, multiple assignment (`a, b = b, a`)
-- functions, **closures with shared mutable upvalues**, recursion
+- functions, **closures with mutable upvalues**, recursion
 - varargs (`...`) and multiple return values
 - control flow: `if`/`elseif`/`else`, `while`, `repeat`/`until`,
-  numeric `for`, generic `for ... in`
+  numeric `for`, generic `for ... in`, `break`, **`goto` / `::label::`**
+- **per-iteration loop-variable capture** (Lua 5.4 semantics): closures made in
+  different iterations capture distinct values
 - tables: array + hash parts, constructors, `t[k]` / `t.k`, `#t`
+- **metatables / metamethods**: `__index`, `__newindex`, `__add` `__sub` `__mul`
+  `__div` `__mod` `__pow` `__idiv` `__unm`, `__eq` `__lt` `__le`, `__concat`,
+  `__len`, `__call`, `__tostring`; `setmetatable` / `getmetatable`
+- **coroutines** (generator subset): `coroutine.create` / `resume` / `yield` /
+  `status` / `running` / `isyieldable` — see the limitation below
 - standard library: `print`, `type`, `tostring`, `tonumber`, `pairs`,
-  `ipairs`, `next`, `select`, `assert`, `error`, `rawget`/`rawequal`/`rawlen`;
+  `ipairs`, `next`, `select`, `assert`, `error`,
+  `rawget`/`rawset`/`rawequal`/`rawlen`;
   `math.*` (`floor ceil abs sqrt max min pi`); `string.*`
-  (`len sub upper lower rep format`); `table.*` (`insert remove concat`)
+  (`len sub upper lower rep`, and full C-style `format`: flags, width,
+  `.precision`, `d i u o x X e E f g G c s q %`); `table.*`
+  (`insert remove concat`)
 
-## Not (yet) supported
+## Coroutines: the limitation
 
-- metatables / metamethods
-- coroutines
-- bitwise operators (`& | ~ << >>`)
-- `goto` / labels
-- `string.format` width/precision specifiers (e.g. `%.2f`); `%d %s %f %x %%` work
-- **closures created inside a loop share the loop variable** (Lua 5.3 behavior,
-  not 5.4's fresh-per-iteration) — a deliberate tradeoff for not allocating a
-  fresh cell every iteration
+Coroutines use an **eager-collect** model rather than true continuations (a
+tree-walking interpreter has no continuation to reify). At the first `resume`,
+the coroutine body runs to completion with each `yield(...)` appending to a
+buffer; subsequent `resume`s deliver the buffered values, then the body's return.
+
+This makes the common **finite generator** idiom work exactly as in Lua:
+
+```lua
+local function gen() for i = 1, 3 do coroutine.yield(i) end end
+local co = coroutine.create(gen)
+print(coroutine.resume(co))  --> true  1
+print(coroutine.resume(co))  --> true  2
+print(coroutine.resume(co))  --> true  3
+print(coroutine.resume(co))  --> true        (body returned)
+print(coroutine.resume(co))  --> false  cannot resume dead coroutine
+```
+
+But it does **not** support: infinite generators (`while true do yield() end`
+runs forever at first resume), values passed back into `yield` via `resume`,
+or side effects interleaved between resumes (they all happen at first resume).
+True coroutines would require restructuring the evaluator into a resumable
+step/CPS form — a separate, larger effort. `coroutine.wrap` is not provided.
+
+## Not yet supported
+
+- the coroutine cases above (true suspension / resume-passing)
+- `goto` into the scope of a local is not statically rejected
+- `__index` chains / `__eq` cover the common cases; metamethods are not invoked
+  by `string.format("%s", t)` or `table.concat` (they use raw `tostring`)
 
 ## Performance
 
