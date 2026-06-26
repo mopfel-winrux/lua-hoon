@@ -84,16 +84,17 @@
       [%fn p=@tas]
       [%co id=@ud]
   ==
-::    a coroutine, eager-collect model: at first resume the body runs to
-::    completion with yield() appending to the store's yield buffer; resume
-::    then delivers the buffered yields (then the body's return) one at a time.
+::    a coroutine holds a SUSPENDED CEK MACHINE (its continuation/env/varargs),
+::    so yield can suspend from any depth and resume re-enters exactly there.
+::    cells/tabs/funs/glob stay global in the store and are shared across
+::    resumes, so interleaved side effects persist (no replay).
 +$  coro
-  $:  fun=value             :: body function
+  $:  fun=value                 :: body function
+      status=?(%susp %dead %run)
       started=?
-      dead=?
-      vals=(list (list value))  :: buffered yields (each a value list)
-      cur=@ud                   :: how many delivered
-      ret=(list value)          :: body return values
+      ksave=kont                :: saved continuation stack
+      esave=scope               :: saved env register
+      vsave=(list value)        :: saved varargs register
   ==
 +$  vkey  $%([%i p=@sd] [%f p=@rd] [%s p=@t] [%b p=?])
 +$  ltable  (map vkey value)
@@ -108,10 +109,52 @@
       glob=(map @t value)
       metas=(map @ud @ud)
       coros=(map @ud coro)
-      ybuf=(unit (list (list value)))
+      curco=(list @ud)
       next=@ud
       out=(list tape)
   ==
+::                                                ::  ::  CEK machine molds
+::    Control register: what the machine is doing this step.
++$  ctrl
+  $%  [%ee e=*]                       :: eval expr -> single (head of vs)
+      [%em e=*]                       :: eval expr -> value LIST
+      [%el acc=(list value) es=(list *)]    :: eval expr-list (evl semantics)
+      [%es whole=(list *) b=(list *)] :: exec stmt list (b=suffix, whole=for goto)
+      [%sif clauses=(list *) els=(unit *)]  :: select an if-clause
+      [%rv vs=(list value)]           :: a value-list produced -> feed top frame
+      [%fl fl=flow]                   :: a block flow produced  -> feed top frame
+      [%halt vs=(list value)]         :: body returned (machine done)
+      [%yield vs=(list value)]        :: coroutine yielded; k holds resumption
+  ==
+::    One continuation frame.  dig:over RULE: a kframe NEVER embeds a kframe
+::    (the rest-of-stack is the list tail) and AST children are `*`, so this
+::    $% is flat (non-recursive) like flow/value and survives ?-/?=.
++$  kframe
+  $%  [%sc op=@t r=*]                 :: and/or short-circuit: have L
+      [%br op=@t r=*]                 :: binop: have L, eval R next
+      [%bl op=@t l=value]             :: binop: have R, combine with L
+      [%un op=@t]                     :: unop: have operand
+      [%ik k=*]                       :: index: have table, eval key
+      [%iv t=value]                   :: index: have key, do index-get
+      [%cf args=(list *)]             :: call: have fn, eval arg-list
+      [%mo m=@t args=(list *)]        :: method: have obj
+      [%ca fn=value pre=(list value)] :: call: have fn(+self), eval'd args=rv
+      [%lc acc=(list value) rest=(list *)]    :: %el accumulator
+      [%ifc b=* more=(list *) els=(unit *)]   :: if: clause cond evaluated
+      [%loc names=(list @t) whole=(list *) b=(list *)]   :: bind locals, continue
+      [%asn tgts=(list *) whole=(list *) b=(list *)]     :: assign, continue
+      [%kseq whole=(list *) b=(list *)]                  :: discard call-stmt
+      [%ret ~]                        :: value-list -> %ret flow
+      [%rt env=scope va=(list value) pre=@ud pf=@ud pt=@ud]   :: closure return
+      [%cont env=scope whole=(list *) b=(list *)]        :: construct done
+      [%nf v=@t i=@sd lim=@sd stp=@sd up=? cap=? body=(list *) e0=scope]
+      [%whb c=* body=(list *) e0=scope]
+      [%gfs names=(list @t) body=(list *) e0=scope]
+      [%gfc names=(list @t) body=(list *) e0=scope f=value st=value]
+      [%gfb names=(list @t) body=(list *) e0=scope f=value st=value ctl=value]
+  ==
++$  kont    (list kframe)
++$  mstate  $:(c=ctrl k=kont env=scope va=(list value) s=store)
 ::                                                ::  ::  char predicates
 ++  dig  |=(c=@ &((gte c '0') (lte c '9')))
 ++  hek
@@ -1160,6 +1203,10 @@
     (ev r.e env va s)
   =^  l  s  (ev l.e env va s)
   =^  r  s  (ev r.e env va s)
+  (binop-apply op l r s)
+++  binop-apply
+  |=  [op=@t l=value r=value s=store]
+  ^-  [value store]
   ?:  =(op '..')  (do-concat l r s)
   ?:  ?|(=(op '==') =(op '~=') =(op '<') =(op '>') =(op '<=') =(op '>='))
     (do-compare op l r s)
@@ -1172,8 +1219,12 @@
   =/  e  ;;(expr ex)
   ?>  ?=(%unop -.e)
   =^  v  s  (ev e.e env va s)
-  ?:  =(op.e 'not')  [[%b !(truthy v)] s]
-  ?:  =(op.e '-')
+  (unop-apply op.e v s)
+++  unop-apply
+  |=  [op=@t v=value s=store]
+  ^-  [value store]
+  ?:  =(op 'not')  [[%b !(truthy v)] s]
+  ?:  =(op '-')
     ?:  ?=(%i -.v)  [[%i (dif:si --0 p.v)] s]
     ?:  ?=(%f -.v)  [[%f (sub:rd .~0 p.v)] s]
     ?:  ?=(%t -.v)
@@ -1183,7 +1234,7 @@
         [?~(rs [%nil ~] i.rs) s]
       ~|(%lua-unary-minus-non-number !!)
     ~|(%lua-unary-minus-non-number !!)
-  ?:  =(op.e '~')
+  ?:  =(op '~')
     [[%i (from-u64 (mix bmask (to-u64 (as-bint v))))] s]
   ?:  ?=(%s -.v)  [[%i (sun:si (lent (trip p.v)))] s]
   ?:  ?=(%t -.v)
@@ -1269,6 +1320,16 @@
     ?:  ?=(%nil -.h)  ~|([%lua-call-non-function -.fnv] !!)
     (apply h [fnv args] s)
   ~|([%lua-call-non-function -.fnv] !!)
+++  bind-params
+  |=  [cl=closure args=(list value) s=store]
+  ^-  [scope store]
+  =/  env2=scope  [*frame env.cl]
+  =/  ps  params.cl
+  =/  as  args
+  |-  ^-  [scope store]
+  ?~  ps  [env2 s]
+  =/  eo  (decl i.ps ?~(as [%nil ~] i.as) env2 s)
+  $(ps t.ps, as ?~(as ~ t.as), env2 -.eo, s +.eo)
 ++  call-closure
   |=  [cl=closure args=(list value) s=store]
   ^-  [(list value) store]
@@ -1276,14 +1337,7 @@
   =/  pre=@ud       next.s
   =/  pre-funs=@ud  ~(wyt by funs.s)
   =/  pre-tabs=@ud  ~(wyt by tabs.s)
-  =/  env2=scope  [*frame env.cl]
-  =/  ps  params.cl
-  =/  as  args
-  =^  env2  s
-    |-  ^-  [scope store]
-    ?~  ps  [env2 s]
-    =/  eo  (decl i.ps ?~(as [%nil ~] i.as) env2 s)
-    $(ps t.ps, as ?~(as ~ t.as), env2 -.eo, s +.eo)
+  =^  env2  s  (bind-params cl args s)
   =/  newva=(list value)
     ?.  vararg.cl  ~
     (slag (lent params.cl) args)
@@ -1662,37 +1716,442 @@
     %goto  res
     %norm  $(s +.res)
   ==
-::                                                ::  ::  coroutines
-::    eager-collect: run the body to completion at first resume, with yield
-::    appending to ybuf; resume then delivers buffered yields, then the
-::    return values, one resume at a time.
+::                                                ::  ::  CEK machine (coroutines)
+::    A resumable step machine used ONLY to run coroutine bodies, so yield can
+::    suspend from any depth.  The main thread keeps using the tree-walker.
+::    All Lua *semantics* are delegated to the shared leaf arms (binop-apply,
+::    index-get, call-builtin, ...); the machine only reifies *control*.
+::    Every machine mold is a FLAT $% (frames never embed frames; the rest of
+::    the stack is the list tail), so none are self-recursive -> no dig:over.
+++  expr-has-call
+  |=  ex=*
+  ^-  ?
+  =/  e  ;;(expr ex)
+  ?-  -.e
+    %nil  %.n   %true  %.n   %false  %.n   %int  %.n   %flt  %.n
+    %str  %.n   %vararg  %.n   %name  %.n   %func  %.n
+    %paren  (expr-has-call e.e)
+    %index  |((expr-has-call t.e) (expr-has-call k.e))
+    %call   %.y
+    %method  %.y
+    %table  (fields-have-call fields.e)
+    %binop  |((expr-has-call l.e) (expr-has-call r.e))
+    %unop   (expr-has-call e.e)
+  ==
+++  fields-have-call
+  |=  fs=(list *)
+  ^-  ?
+  ?~  fs  %.n
+  =/  f  ;;(tfield i.fs)
+  =/  hit=?
+    ?-  -.f
+      %pos   (expr-has-call v.f)
+      %key   |((expr-has-call k.f) (expr-has-call v.f))
+      %name  (expr-has-call v.f)
+    ==
+  ?:  hit  %.y
+  $(fs t.fs)
+::  does a statement / block contain a CALL anywhere (so it could yield)?
+++  blk-has-call
+  |=  b=(list *)
+  ^-  ?
+  ?~  b  %.n
+  ?:  (stmt-has-call i.b)  %.y
+  $(b t.b)
+++  stmt-has-call
+  |=  st1=*
+  ^-  ?
+  =/  st  ;;(stmt st1)
+  ?-  -.st
+      %local      (exprs-have-call exprs.st)
+      %localfunc  (expr-has-call f.st)
+      %assign     |((exprs-have-call targets.st) (exprs-have-call exprs.st))
+      %call       %.y
+      %do         (blk-has-call ;;((list *) body.st))
+      %while      |((expr-has-call c.st) (blk-has-call ;;((list *) body.st)))
+      %repeat     |((blk-has-call ;;((list *) body.st)) (expr-has-call c.st))
+      %if         (if-has-call clauses.st els.st)
+  ::
+      %numfor
+    ?|  (expr-has-call from.st)
+        (expr-has-call to.st)
+        ?~(step.st %.n (expr-has-call u.step.st))
+        (blk-has-call ;;((list *) body.st))
+    ==
+  ::
+      %genfor   |((exprs-have-call exprs.st) (blk-has-call ;;((list *) body.st)))
+      %return   (exprs-have-call exprs.st)
+      %label    %.n
+      %goto     %.n
+      %break    %.n
+  ==
+++  if-has-call
+  |=  [clauses=(list [c=* b=*]) els=(unit *)]
+  ^-  ?
+  ?:  ?&(?=(^ els) (blk-has-call ;;((list *) u.els)))  %.y
+  |-  ^-  ?
+  ?~  clauses  %.n
+  ?:  (expr-has-call c.i.clauses)  %.y
+  ?:  (blk-has-call ;;((list *) b.i.clauses))  %.y
+  $(clauses t.clauses)
+++  exprs-have-call
+  |=  es=(list *)
+  ^-  ?
+  ?~  es  %.n
+  ?:  (expr-has-call i.es)  %.y
+  $(es t.es)
+++  run-mach
+  |=  m=mstate
+  ^-  mstate
+  ?:  ?|(?=(%halt -.c.m) ?=(%yield -.c.m))  m
+  $(m (step m))
+++  step
+  |=  m=mstate
+  ^-  mstate
+  ?-  -.c.m
+    %ee     (step-ee m)
+    %em     (step-em m)
+    %el     (step-el m)
+    %es     (step-es m)
+    %sif    (step-sif m)
+    %rv     (step-rv m)
+    %fl     (step-fl m)
+    %halt   m
+    %yield  m
+  ==
+::  eval expr to a single value (consumer takes head of the rv list)
+++  step-ee
+  |=  m=mstate
+  ^-  mstate
+  ?>  ?=(%ee -.c.m)
+  =/  e  ;;(expr e.c.m)
+  ?.  (expr-has-call e)
+    =^  v  s.m  (ev e env.m va.m s.m)
+    m(c [%rv ~[v]])
+  ?-  -.e
+    %paren   m(c [%ee e.e])
+    %call    m(c [%em e])
+    %method  m(c [%em e])
+    %index   m(c [%ee t.e], k [[%ik k.e] k.m])
+    %unop    m(c [%ee e.e], k [[%un op.e] k.m])
+  ::
+      %binop
+    ?:  ?|(=(op.e 'and') =(op.e 'or'))  m(c [%ee l.e], k [[%sc op.e r.e] k.m])
+    m(c [%ee l.e], k [[%br op.e r.e] k.m])
+  ::
+      %table  ~|(%lua-yield-in-table-unsupported !!)
+      %nil    m(c [%rv ~[[%nil ~]]])
+      %true   m(c [%rv ~[[%b %.y]]])
+      %false  m(c [%rv ~[[%b %.n]]])
+      %int    m(c [%rv ~[[%i p.e]]])
+      %flt    m(c [%rv ~[[%f p.e]]])
+      %str    m(c [%rv ~[[%s p.e]]])
+      %name   m(c [%rv ~[(rd-var p.e env.m s.m)]])
+      %vararg  m(c [%rv va.m])
+      %func   =^(v s.m (ev e env.m va.m s.m) m(c [%rv ~[v]]))
+  ==
+::  eval expr to a value LIST (call/method expand; vararg)
+++  step-em
+  |=  m=mstate
+  ^-  mstate
+  ?>  ?=(%em -.c.m)
+  =/  e  ;;(expr e.c.m)
+  ?:  ?=(%vararg -.e)  m(c [%rv va.m])
+  ?.  (expr-has-call e)
+    =^  vs  s.m  (evm e env.m va.m s.m)
+    m(c [%rv vs])
+  ?:  ?=(%call -.e)    m(c [%ee f.e], k [[%cf args.e] k.m])
+  ?:  ?=(%method -.e)  m(c [%ee o.e], k [[%mo m.e args.e] k.m])
+  m(c [%ee e])
+::  eval an expr-list to a value-list (evl semantics: last item multi-expands)
+++  step-el
+  |=  m=mstate
+  ^-  mstate
+  ?>  ?=(%el -.c.m)
+  =/  es  es.c.m
+  ?~  es  m(c [%rv acc.c.m])
+  ?~  t.es  m(c [%em i.es], k [[%lc acc.c.m ~] k.m])
+  m(c [%ee i.es], k [[%lc acc.c.m t.es] k.m])
+::  execute a statement list
+++  step-es
+  |=  m=mstate
+  ^-  mstate
+  ?>  ?=(%es -.c.m)
+  =/  whole  whole.c.m
+  ?~  b.c.m  m(c [%fl [%norm ~]])
+  =/  st  ;;(stmt i.b.c.m)
+  =/  rest  t.b.c.m
+  ?-  -.st
+      %local   m(c [%el ~ exprs.st], k [[%loc names.st whole rest] k.m])
+      %assign  m(c [%el ~ exprs.st], k [[%asn targets.st whole rest] k.m])
+      %call    m(c [%em e.st], k [[%kseq whole rest] k.m])
+      %return  m(c [%el ~ exprs.st], k [[%ret ~] k.m])
+      %break   m(c [%fl [%brk ~]])
+      %label   m(c [%es whole rest])
+  ::
+      %goto
+    =/  tgt  (find-label ;;((list stmt) whole) name.st)
+    ?~  tgt  m(c [%fl [%goto name.st]])
+    m(c [%es whole `(list *)`u.tgt])
+  ::
+      %do
+    m(c [%es ;;((list stmt) body.st) ;;((list stmt) body.st)], k [[%cont env.m whole rest] k.m])
+  ::
+      %if
+    m(c [%sif clauses.st els.st], k [[%cont env.m whole rest] k.m])
+  ::
+      %while
+    =/  body  ;;((list stmt) body.st)
+    ?.  (blk-has-call body)
+      =/  res  (do-while c.st body.st env.m va.m s.m)
+      m(c [%fl -.res], s +.res, k [[%cont env.m whole rest] k.m])
+    m(c [%fl [%norm ~]], k [[%whb c.st body env.m] [[%cont env.m whole rest] k.m]])
+  ::
+      %numfor
+    =/  body  ;;((list stmt) body.st)
+    ?.  (blk-has-call body)
+      =/  res  (do-numfor st env.m va.m s.m)
+      m(c [%fl -.res], s +.res, k [[%cont env.m whole rest] k.m])
+    (nfor-init st env.m [[%cont env.m whole rest] k.m] m)
+  ::
+      %repeat
+    =/  res  (do-repeat body.st c.st env.m va.m s.m)
+    m(c [%fl -.res], s +.res, k [[%cont env.m whole rest] k.m])
+  ::
+      %genfor
+    =/  body  ;;((list *) body.st)
+    ?.  (blk-has-call body)
+      =/  res  (do-genfor st env.m va.m s.m)
+      m(c [%fl -.res], s +.res, k [[%cont env.m whole rest] k.m])
+    m(c [%el ~ exprs.st], k [[%gfs names.st body env.m] [[%cont env.m whole rest] k.m]])
+  ::
+      %localfunc
+    =/  eo  (bind-locals ~[name.st] ~[[%nil ~]] env.m s.m)
+    =.  env.m  -.eo
+    =.  s.m  +.eo
+    =^  fv  s.m  (ev f.st env.m va.m s.m)
+    =.  s.m  (set-var name.st fv env.m s.m)
+    m(c [%es whole rest])
+  ==
+::  select an if-clause
+++  step-sif
+  |=  m=mstate
+  ^-  mstate
+  ?>  ?=(%sif -.c.m)
+  ?~  clauses.c.m
+    ?~  els.c.m  m(c [%fl [%norm ~]])
+    m(c [%es ;;((list stmt) u.els.c.m) ;;((list stmt) u.els.c.m)])
+  =/  cl  ;;([c=* b=*] i.clauses.c.m)
+  m(c [%ee c.cl], k [[%ifc b.cl t.clauses.c.m els.c.m] k.m])
+::  consume a produced value-list: feed the top frame
+++  step-rv
+  |=  m=mstate
+  ^-  mstate
+  ?>  ?=(%rv -.c.m)
+  =/  rv  vs.c.m
+  ?~  k.m  m(c [%halt rv])
+  =/  fr=kframe  i.k.m
+  =/  kr=kont  t.k.m
+  =/  hd  ?~(rv [%nil ~] i.rv)
+  ?+  -.fr  ~|([%lua-bad-rv-frame -.fr] !!)
+      %sc
+    ?:  =(op.fr 'and')
+      ?:((truthy hd) m(c [%ee r.fr], k kr) m(c [%rv ~[hd]], k kr))
+    ?:((truthy hd) m(c [%rv ~[hd]], k kr) m(c [%ee r.fr], k kr))
+  ::
+      %br   m(c [%ee r.fr], k [[%bl op.fr hd] kr])
+      %bl   =^(res s.m (binop-apply op.fr l.fr hd s.m) m(c [%rv ~[res]], k kr))
+      %un   =^(res s.m (unop-apply op.fr hd s.m) m(c [%rv ~[res]], k kr))
+      %ik   m(c [%ee k.fr], k [[%iv hd] kr])
+      %iv   =^(res s.m (index-get t.fr hd s.m) m(c [%rv ~[res]], k kr))
+      %cf   m(c [%el ~ args.fr], k [[%ca hd ~] kr])
+      %mo
+    =^  fnv  s.m  (index-get hd [%s m.fr] s.m)
+    m(c [%el ~ args.fr], k [[%ca fnv ~[hd]] kr])
+  ::
+      %ca   (enter-call fn.fr (weld pre.fr rv) m(k kr))
+      %lc
+    ?~  rest.fr  m(c [%rv (weld acc.fr rv)], k kr)
+    =/  acc2  (snoc acc.fr hd)
+    ?~  t.rest.fr  m(c [%em i.rest.fr], k [[%lc acc2 ~] kr])
+    m(c [%ee i.rest.fr], k [[%lc acc2 t.rest.fr] kr])
+  ::
+      %ifc
+    ?:  (truthy hd)
+      m(c [%es ;;((list stmt) b.fr) ;;((list stmt) b.fr)], k kr)
+    m(c [%sif more.fr els.fr], k kr)
+  ::
+      %loc
+    =/  env2  (bind-locals names.fr rv env.m s.m)
+    m(c [%es whole.fr b.fr], env -.env2, s +.env2, k kr)
+  ::
+      %asn
+    =.  s.m  (do-assign tgts.fr rv env.m va.m s.m)
+    m(c [%es whole.fr b.fr], k kr)
+  ::
+      %kseq   m(c [%es whole.fr b.fr], k kr)
+      %ret    m(c [%fl [%ret rv]], k kr)
+  ::
+      %gfs
+    =/  f  (arg 0 rv)
+    =/  st8  (arg 1 rv)
+    =/  ctl  (arg 2 rv)
+    (enter-call f ~[st8 ctl] m(k [[%gfc names.fr body.fr e0.fr f st8] kr]))
+  ::
+      %gfc
+    ?:  ?=(%nil -.hd)  m(c [%fl [%norm ~]], k kr)
+    =/  env2  (bind-locals names.fr rv e0.fr s.m)
+    m(c [%es body.fr body.fr], env -.env2, s +.env2, k [[%gfb names.fr body.fr e0.fr f.fr st.fr hd] kr])
+  ==
+::  consume a produced flow: feed the top flow-frame
+++  step-fl
+  |=  m=mstate
+  ^-  mstate
+  ?>  ?=(%fl -.c.m)
+  =/  fl  fl.c.m
+  ?~  k.m  m(c [%halt ~])
+  =/  fr=kframe  i.k.m
+  =/  kr=kont  t.k.m
+  ?+  -.fr  ~|([%lua-bad-fl-frame -.fr] !!)
+      %rt
+    =.  s.m
+      ?.  &(=(pf.fr ~(wyt by funs.s.m)) =(pt.fr ~(wyt by tabs.s.m)))  s.m
+      s.m(next pre.fr, cells (prune-cells cells.s.m pre.fr next.s.m))
+    ?-  -.fl
+      %ret   m(c [%rv vs.fl], env env.fr, va va.fr, k kr)
+      %norm  m(c [%rv ~], env env.fr, va va.fr, k kr)
+      %brk   ~|(%lua-break-outside-loop !!)
+      %goto  ~|([%lua-no-visible-label name.fl] !!)
+    ==
+  ::
+      %cont
+    ?-  -.fl
+        %norm  m(c [%es whole.fr b.fr], env env.fr, k kr)
+        %brk   m(c [%fl [%brk ~]], k kr)
+        %ret   m(c [%fl [%ret vs.fl]], k kr)
+        %goto
+      =/  tgt  (find-label ;;((list stmt) whole.fr) name.fl)
+      ?~  tgt  m(c [%fl [%goto name.fl]], k kr)
+      m(c [%es whole.fr `(list *)`u.tgt], env env.fr, k kr)
+    ==
+  ::
+      %nf
+    ?-  -.fl
+      %ret   m(c [%fl [%ret vs.fl]], k kr)
+      %goto  m(c [%fl [%goto name.fl]], k kr)
+      %brk   m(c [%fl [%norm ~]], env e0.fr, k kr)
+        %norm
+      =/  ni  (sum:si i.fr stp.fr)
+      (nfor-step fr(i ni) kr m)
+    ==
+  ::
+      %whb
+    ?-  -.fl
+      %ret   m(c [%fl [%ret vs.fl]], k kr)
+      %goto  m(c [%fl [%goto name.fl]], k kr)
+      %brk   m(c [%fl [%norm ~]], env e0.fr, k kr)
+      %norm  (while-step c.fr body.fr e0.fr kr m)
+    ==
+  ::
+      %gfb
+    ?-  -.fl
+      %ret   m(c [%fl [%ret vs.fl]], k kr)
+      %goto  m(c [%fl [%goto name.fl]], k kr)
+      %brk   m(c [%fl [%norm ~]], env e0.fr, k kr)
+        %norm
+      (enter-call f.fr ~[st.fr ctl.fr] m(env e0.fr, k [[%gfc names.fr body.fr e0.fr f.fr st.fr] kr]))
+    ==
+  ==
+::  start a machine numeric-for (body has a call): set up loop var, first test
+++  nfor-init
+  |=  [st=stmt env=scope kr=kont m=mstate]
+  ^-  mstate
+  ?>  ?=(%numfor -.st)
+  =/  body  ;;((list stmt) body.st)
+  =/  cap   (blk-has-func body)
+  =^  fromv  s.m  (ev from.st env va.m s.m)
+  =^  tov  s.m  (ev to.st env va.m s.m)
+  =^  stepv  s.m  ?~(step.st [`value`[%i --1] s.m] (ev u.step.st env va.m s.m))
+  ?>  ?&(?=(%i -.fromv) ?=(%i -.tov) ?=(%i -.stepv))
+  =/  fr=kframe
+    [%nf v.st p.fromv p.tov p.stepv (syn:si p.stepv) cap body env]
+  (nfor-step fr kr m)
+::  one numeric-for iteration (or finish)
+++  nfor-step
+  |=  [fr=kframe kr=kont m=mstate]
+  ^-  mstate
+  ?>  ?=(%nf -.fr)
+  ?.  ?:(up.fr (sle i.fr lim.fr) (sge i.fr lim.fr))
+    m(c [%fl [%norm ~]], env e0.fr, k kr)
+  =^  env2  s.m
+    ?:  cap.fr  (decl v.fr [%i i.fr] e0.fr s.m)
+    [e0.fr (set-var v.fr [%i i.fr] e0.fr s.m)]
+  m(c [%es body.fr body.fr], env env2, k [fr kr])
+::  one while iteration: test condition, run body or exit
+++  while-step
+  |=  [c=* body=(list *) e0=scope kr=kont m=mstate]
+  ^-  mstate
+  =^  cv  s.m  (ev c e0 va.m s.m)
+  ?.  (truthy cv)  m(c [%fl [%norm ~]], env e0, k kr)
+  m(c [%es body body], env e0, k [[%whb c body e0] kr])
+::  enter a call ON THE MACHINE (closures run as machine frames; coyield suspends)
+++  enter-call
+  |=  [fnv=value args=(list value) m=mstate]
+  ^-  mstate
+  ?:  ?=(%c -.fnv)
+    =/  cl  (~(got by funs.s.m) id.fnv)
+    =/  pre=@ud  next.s.m
+    =/  pf=@ud  ~(wyt by funs.s.m)
+    =/  pt=@ud  ~(wyt by tabs.s.m)
+    =^  env2  s.m  (bind-params cl args s.m)
+    =/  nva=(list value)  ?:(vararg.cl (slag (lent params.cl) args) ~)
+    =/  bd  ;;((list stmt) body.cl)
+    m(c [%es bd bd], env env2, va nva, k [[%rt env.m va.m pre pf pt] k.m])
+  ?:  ?=(%fn -.fnv)
+    ?:  =(p.fnv %coyield)  m(c [%yield args])
+    ?:  =(p.fnv %coresume)
+      =^  rv  s.m  (do-resume args s.m)
+      m(c [%rv rv])
+    =^  rv  s.m  (call-builtin p.fnv args s.m)
+    m(c [%rv rv])
+  ?:  ?=(%t -.fnv)
+    =/  h  (mm-lookup fnv '__call' s.m)
+    ?:  ?=(%nil -.h)  ~|([%lua-call-non-function -.fnv] !!)
+    (enter-call h [fnv args] m)
+  ~|([%lua-call-non-function -.fnv] !!)
+::  coroutine.resume: a nested trampoline over the coro's saved machine
 ++  do-resume
-  |=  [coid=@ud args=(list value) s=store]
+  |=  [args=(list value) s=store]
   ^-  [(list value) store]
+  =/  cov  (arg 0 args)
+  ?.  ?=(%co -.cov)  ~|(%lua-resume-non-coroutine !!)
+  =/  coid  id.cov
+  =/  rargs  ?~(args ~ t.args)
   =/  co  (~(got by coros.s) coid)
-  ?:  dead.co  [~[[%b %.n] [%s 'cannot resume dead coroutine']] s]
-  ?:  !started.co
-    =/  saved  ybuf.s
-    =.  ybuf.s  `~
-    =^  rv  s  (apply fun.co args s)
-    =/  collected=(list (list value))  ?~(ybuf.s ~ u.ybuf.s)
-    =.  ybuf.s  saved
-    =.  co  co(started %.y, vals collected, ret rv)
-    ?~  collected
-      =.  co  co(dead %.y)
-      =.  coros.s  (~(put by coros.s) coid co)
-      [[[%b %.y] ret.co] s]
-    =.  co  co(cur 1)
-    =.  coros.s  (~(put by coros.s) coid co)
-    [[[%b %.y] i.collected] s]
-  ?:  (lth cur.co (lent vals.co))
-    =/  v  (snag cur.co vals.co)
-    =.  co  co(cur +(cur.co))
-    =.  coros.s  (~(put by coros.s) coid co)
-    [[[%b %.y] v] s]
-  =.  co  co(dead %.y)
-  =.  coros.s  (~(put by coros.s) coid co)
-  [[[%b %.y] ret.co] s]
+  ?:  ?=(%dead status.co)  [~[[%b %.n] [%s 'cannot resume dead coroutine']] s]
+  ?:  ?=(%run status.co)   [~[[%b %.n] [%s 'cannot resume non-suspended coroutine']] s]
+  =.  coros.s  (~(put by coros.s) coid co(status %run, started %.y))
+  =.  curco.s  [coid curco.s]
+  =/  m0=mstate
+    ?:  started.co
+      [[%rv rargs] ksave.co esave.co vsave.co s]
+    (enter-call fun.co rargs [[%rv ~] ~ ~ ~ s])
+  =/  mf  (run-mach m0)
+  =.  s  s.mf
+  =.  curco.s  ?~(curco.s ~ t.curco.s)
+  =/  co2  (~(got by coros.s) coid)
+  ?-  -.c.mf
+      %halt
+    =.  coros.s  (~(put by coros.s) coid co2(status %dead))
+    [[[%b %.y] vs.c.mf] s]
+  ::
+      %yield
+    =/  co3  co2(status %susp, ksave k.mf, esave env.mf, vsave va.mf)
+    =.  coros.s  (~(put by coros.s) coid co3)
+    [[[%b %.y] vs.c.mf] s]
+  ::
+      *  ~|(%lua-coro-stuck !!)
+  ==
 ::                                                ::  ::  builtins
 ++  call-builtin
   |=  [nm=@tas args=(list value) s=store]
@@ -1700,26 +2159,28 @@
   ?+    nm  ~|([%lua-unknown-builtin nm] !!)
       %cocreate
     =^  id  s  (fresh s)
-    =.  coros.s  (~(put by coros.s) id [(arg 0 args) %.n %.n ~ 0 ~])
+    =.  coros.s  (~(put by coros.s) id [(arg 0 args) %susp %.n ~ ~ ~])
     [~[[%co id]] s]
   ::
-      %coresume
-    =/  cov  (arg 0 args)
-    ?.  ?=(%co -.cov)  ~|(%lua-resume-non-coroutine !!)
-    (do-resume id.cov ?~(args ~ t.args) s)
+      %coresume  (do-resume args s)
   ::
-      %coyield
-    ?~  ybuf.s  ~|(%lua-yield-outside-coroutine !!)
-    [~ s(ybuf `(snoc u.ybuf.s args))]
+      %coyield  ~|(%lua-yield-outside-coroutine !!)
   ::
       %costatus
     =/  cov  (arg 0 args)
     ?.  ?=(%co -.cov)  ~|(%lua-status-non-coroutine !!)
     =/  co  (~(got by coros.s) id.cov)
-    [~[[%s ?:(dead.co 'dead' 'suspended')]] s]
+    =/  txt=@t
+      ?:  =(`id.cov ?~(curco.s ~ `i.curco.s))  'running'
+      ?:  (lien curco.s |=(c=@ud =(c id.cov)))  'normal'
+      ?-(status.co %dead 'dead', %susp 'suspended', %run 'running')
+    [~[[%s txt]] s]
   ::
-      %corunning    [~[[%nil ~] [%b %.y]] s]
-      %coyieldable  [~[[%b ?=(^ ybuf.s)]] s]
+      %corunning
+    ?~  curco.s  [~[[%nil ~] [%b %.y]] s]
+    [~[[%co i.curco.s] [%b %.n]] s]
+  ::
+      %coyieldable  [~[[%b ?=(^ curco.s)]] s]
   ::
       %print
     =^  parts  s  (tostr-args args s)

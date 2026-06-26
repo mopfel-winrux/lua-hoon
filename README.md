@@ -74,8 +74,8 @@ Lua source cord and returns its stdout as a `(list tape)`.
 - **metatables / metamethods**: `__index`, `__newindex`, `__add` `__sub` `__mul`
   `__div` `__mod` `__pow` `__idiv` `__unm`, `__eq` `__lt` `__le`, `__concat`,
   `__len`, `__call`, `__tostring`; `setmetatable` / `getmetatable`
-- **coroutines** (generator subset): `coroutine.create` / `resume` / `yield` /
-  `status` / `running` / `isyieldable` — see the limitation below
+- **true coroutines** (real suspension from any depth): `coroutine.create` /
+  `resume` / `yield` / `status` / `running` / `isyieldable` — see notes below
 - standard library: `print`, `type`, `tostring`, `tonumber`, `pairs`,
   `ipairs`, `next`, `select`, `assert`, `error`,
   `rawget`/`rawset`/`rawequal`/`rawlen`;
@@ -84,34 +84,56 @@ Lua source cord and returns its stdout as a `(list tape)`.
   `.precision`, `d i u o x X e E f g G c s q %`); `table.*`
   (`insert remove concat`)
 
-## Coroutines: the limitation
+## Coroutines
 
-Coroutines use an **eager-collect** model rather than true continuations (a
-tree-walking interpreter has no continuation to reify). At the first `resume`,
-the coroutine body runs to completion with each `yield(...)` appending to a
-buffer; subsequent `resume`s deliver the buffered values, then the body's return.
-
-This makes the common **finite generator** idiom work exactly as in Lua:
+These are **true** coroutines, not a generator fake. `yield` suspends from any
+depth — inside a loop, a nested call, an `if` — and `resume` re-enters exactly
+where it left off, with values passed both ways. So all of these work as in
+real Lua: infinite generators, resume-value passing, side effects interleaved
+between resumes, and nested (asymmetric) coroutines.
 
 ```lua
-local function gen() for i = 1, 3 do coroutine.yield(i) end end
+-- yield from inside a loop; driven across resumes
+local function gen(n) for i = 1, n do coroutine.yield(i) end end
 local co = coroutine.create(gen)
-print(coroutine.resume(co))  --> true  1
-print(coroutine.resume(co))  --> true  2
-print(coroutine.resume(co))  --> true  3
-print(coroutine.resume(co))  --> true        (body returned)
-print(coroutine.resume(co))  --> false  cannot resume dead coroutine
+print(coroutine.resume(co, 3))  --> true  1
+print(coroutine.resume(co))     --> true  2
+print(coroutine.resume(co))     --> true  3
+print(coroutine.resume(co))     --> true        (body returned)
+print(coroutine.resume(co))     --> false  cannot resume dead coroutine
+
+-- resume args flow back as yield's return value
+local c = coroutine.create(function() local x = coroutine.yield(10); return x + 1 end)
+print(coroutine.resume(c))      --> true  10
+print(coroutine.resume(c, 99))  --> true  100
 ```
 
-But it does **not** support: infinite generators (`while true do yield() end`
-runs forever at first resume), values passed back into `yield` via `resume`,
-or side effects interleaved between resumes (they all happen at first resume).
-True coroutines would require restructuring the evaluator into a resumable
-step/CPS form — a separate, larger effort. `coroutine.wrap` is not provided.
+### How it works
+
+The main thread runs on the recursive tree-walker (fast, common case). A
+coroutine body instead runs on a small **CEK step machine**: its continuation
+is reified as a flat `(list kframe)` stored in the coroutine, so `yield` simply
+parks that stack and returns to the resumer, and `resume` spins the machine
+again from the saved state. Both evaluators share every leaf arm (arithmetic,
+indexing, metamethods, builtins), so semantics stay identical. Sub-expressions
+that provably contain no call skip the machine and run atomically, so a hot
+yield-free loop body inside a coroutine keeps tree-walker speed.
+
+### Coroutine limits
+
+- `coroutine.wrap` is not provided (use `create` + `resume`).
+- You cannot `yield` across a **builtin or metamethod** boundary — e.g. a
+  `yield` inside an `__index` function, a `pcall`, or a `table.sort` comparator
+  errors (`yield outside coroutine`). This mirrors Lua's historical "attempt to
+  yield across a C-call boundary."
+- A runtime error inside a coroutine body propagates as a host crash rather
+  than being caught and returned as `false, msg`.
+- `numeric for` with **float** bounds and a `yield` in its body is unsupported
+  (integer numeric-for, while, and generic-for all work).
 
 ## Not yet supported
 
-- the coroutine cases above (true suspension / resume-passing)
+- the coroutine cases above (wrap, yield-across-builtin, float-for yield)
 - `goto` into the scope of a local is not statically rejected
 - `__index` chains / `__eq` cover the common cases; metamethods are not invoked
   by `string.format("%s", t)` or `table.concat` (they use raw `tostring`)
