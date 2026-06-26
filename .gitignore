@@ -1,0 +1,3 @@
+# urbit piers / build output
+*/.urb/
+*.lock
