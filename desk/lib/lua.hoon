@@ -10,6 +10,16 @@
 |%
 ::                                                ::  ::  types
 +$  number  $%([%i p=@sd] [%f p=@rd])
++$  fspec
+  $:  fm=?         :: '-'  left-justify
+      fp=?         :: '+'  force sign
+      fsp=?        :: ' '  space before positive
+      fh=?         :: '#'  alternate form
+      fz=?         :: '0'  zero-pad
+      width=@ud
+      prec=(unit @ud)
+      conv=@t
+  ==
 +$  token
   $%  [%name p=@t]
       [%kw p=@t]
@@ -57,6 +67,8 @@
       [%numfor v=@t from=* to=* step=(unit *) body=*]
       [%genfor names=(list @t) exprs=(list *) body=*]
       [%return exprs=(list *)]
+      [%label name=@t]
+      [%goto name=@t]
       [%break ~]
   ==
 +$  block  (list *)
@@ -76,7 +88,7 @@
 +$  closure  [params=(list @t) vararg=? body=(list stmt) env=scope]
 +$  frame  (map @t @ud)
 +$  scope  (list frame)
-+$  flow   $%([%norm ~] [%brk ~] [%ret vs=(list value)])
++$  flow   $%([%norm ~] [%brk ~] [%ret vs=(list value)] [%goto name=@t])
 +$  store
   $:  cells=(map @ud value)
       tabs=(map @ud ltable)
@@ -169,6 +181,28 @@
   ?:  =(b --0)  ~|(%integer-modulo-by-zero !!)
   =/  q  (ifloordiv a b)
   (dif:si a (pro:si q b))
+::                                                ::  ::  bitwise (64-bit)
+++  bmask  ^-(@ (dec (bex 64)))
+++  to-u64
+  |=  i=@sd
+  ^-  @
+  ?:  (syn:si i)  (dis (abs:si i) bmask)
+  (dis (sub (bex 64) (dis (abs:si i) bmask)) bmask)
+++  from-u64
+  |=  u=@
+  ^-  @sd
+  ?:  (lth u (bex 63))  (sun:si u)
+  (new:si %.n (sub (bex 64) u))
+++  lua-shl
+  |=  [x=@ n=@sd]
+  ^-  @
+  ?:  (syn:si n)
+    =/  k  (abs:si n)
+    ?:  (gte k 64)  0
+    (dis (lsh [0 k] x) bmask)
+  =/  k  (abs:si n)
+  ?:  (gte k 64)  0
+  (rsh [0 k] x)
 ::                                                ::  ::  number formatting
 ++  fmt-int
   |=  i=@sd
@@ -305,6 +339,8 @@
   ?:  &(=(c '~') =(d '='))  [[%op '~='] r2]
   ?:  &(=(c '<') =(d '='))  [[%op '<='] r2]
   ?:  &(=(c '>') =(d '='))  [[%op '>='] r2]
+  ?:  &(=(c '<') =(d '<'))  [[%op '<<'] r2]
+  ?:  &(=(c '>') =(d '>'))  [[%op '>>'] r2]
   ?:  &(=(c '/') =(d '/'))  [[%op '//'] r2]
   ?:  &(=(c ':') =(d ':'))  [[%op '::'] r2]
   [[%op (crip ~[c])] r1]
@@ -414,10 +450,19 @@
   ?:  (is-kw h 'while')   (parse-while (nx q))
   ?:  (is-kw h 'repeat')  (parse-repeat (nx q))
   ?:  (is-kw h 'for')     (parse-for (nx q))
+  ?:  (is-kw h 'break')   [[%break ~] (nx q)]
   ?:  (is-kw h 'function')  (parse-funcstmt (nx q))
   ?:  (is-kw h 'do')
     =/  r  (parse-block (nx q))
     [[%do p.r] (expect-kw q.r 'end')]
+  ?:  (is-kw h 'goto')
+    =/  h2  (hed (nx q))
+    ?.  ?=(%name -.h2)  ~|(%lua-expected-goto-label !!)
+    [[%goto p.h2] (nx (nx q))]
+  ?:  (is-op h '::')
+    =/  h2  (hed (nx q))
+    ?.  ?=(%name -.h2)  ~|(%lua-expected-label-name !!)
+    [[%label p.h2] (expect-op (nx (nx q)) '::')]
   (parse-exprstmt q)
 ++  parse-local
   |=  q=(list token)
@@ -595,9 +640,13 @@
   ?.  ?=([%op *] t)  ~
   =/  s  p.t
   ?:  ?|(=(s '<') =(s '>') =(s '<=') =(s '>=') =(s '~=') =(s '=='))  `3
-  ?:  =(s '..')  `4
-  ?:  |(=(s '+') =(s '-'))  `5
-  ?:  ?|(=(s '*') =(s '/') =(s '//') =(s '%'))  `6
+  ?:  =(s '|')  `4
+  ?:  =(s '~')  `5
+  ?:  =(s '&')  `6
+  ?:  |(=(s '<<') =(s '>>'))  `7
+  ?:  =(s '..')  `8
+  ?:  |(=(s '+') =(s '-'))  `9
+  ?:  ?|(=(s '*') =(s '/') =(s '//') =(s '%'))  `10
   ~
 ++  parse-bin
   |=  [q=(list token) minp=@ud]
@@ -618,7 +667,7 @@
   |=  q=(list token)
   ^-  [p=expr q=(list token)]
   =/  h  (hed q)
-  ?:  |((is-kw h 'not') (is-op h '-') (is-op h '#'))
+  ?:  |((is-kw h 'not') (is-op h '-') (is-op h '#') (is-op h '~'))
     =/  op=@t  ?:((is-kw h 'not') 'not' (op-str h))
     =/  r  (parse-unary (nx q))
     [[%unop op p.r] q.r]
@@ -839,6 +888,26 @@
   =/  u  (toi:rd p.v)
   ?~  u  ~|(%lua-not-an-integer !!)
   u.u
+++  as-bint
+  |=  v=value
+  ^-  @sd
+  ?:  ?=(%i -.v)  p.v
+  ?.  ?=(%f -.v)  ~|(%lua-bitwise-on-non-integer !!)
+  =/  u  (toi:rd p.v)
+  ?~  u  ~|(%lua-number-has-no-integer-representation !!)
+  ?.  (equ:rd p.v (i2f u.u))  ~|(%lua-number-has-no-integer-representation !!)
+  u.u
+++  bitwise
+  |=  [op=@t a=value b=value]
+  ^-  value
+  =/  x  (to-u64 (as-bint a))
+  ?:  =(op '<<')  [%i (from-u64 (lua-shl x (as-bint b)))]
+  ?:  =(op '>>')  [%i (from-u64 (lua-shl x (dif:si --0 (as-bint b))))]
+  =/  y  (to-u64 (as-bint b))
+  ?:  =(op '&')  [%i (from-u64 (dis x y))]
+  ?:  =(op '|')  [%i (from-u64 (con x y))]
+  ?:  =(op '~')  [%i (from-u64 (mix x y))]
+  ~|([%lua-bad-bitwise op] !!)
 ++  arith
   |=  [op=@t a=value b=value]
   ^-  value
@@ -962,6 +1031,8 @@
   ?:  =(op '..')  [(concat l r) s]
   ?:  ?|(=(op '==') =(op '~=') =(op '<') =(op '>') =(op '<=') =(op '>='))
     [(compare op l r) s]
+  ?:  ?|(=(op '&') =(op '|') =(op '~') =(op '<<') =(op '>>'))
+    [(bitwise op l r) s]
   [(arith op l r) s]
 ++  ev-unop
   |=  [ex=* env=scope va=(list value) s=store]
@@ -974,6 +1045,8 @@
     ?:  ?=(%i -.v)  [[%i (dif:si --0 p.v)] s]
     ?:  ?=(%f -.v)  [[%f (sub:rd .~0 p.v)] s]
     ~|(%lua-unary-minus-non-number !!)
+  ?:  =(op.e '~')
+    [[%i (from-u64 (mix bmask (to-u64 (as-bint v))))] s]
   ?:  ?=(%s -.v)  [[%i (sun:si (lent (trip p.v)))] s]
   ?:  ?=(%t -.v)  [[%i (tab-len id.v s)] s]
   ~|(%lua-length-of-non-table !!)
@@ -1078,6 +1151,7 @@
   ?-  -.fl
     %ret   [vs.fl s2]
     %brk   [~ s2]
+    %goto  ~|([%lua-no-visible-label name.fl] !!)
     %norm  [~ s2]
   ==
 ++  prune-cells
@@ -1086,11 +1160,19 @@
   ?:  =(lo hi)  m
   $(m (~(del by m) lo), lo +(lo))
 ::                                                ::  ::  statements
+::  return the suffix of a block starting AT the matching label, else ~
+++  find-label
+  |=  [b=(list stmt) nm=@t]
+  ^-  (unit (list stmt))
+  ?~  b  ~
+  ?:  ?&(?=(%label -.i.b) =(name.i.b nm))  `b
+  $(b t.b)
 ++  do-stmts
   ::  takes an already-clammed statement list, so blocks executed
   ::  repeatedly (loop bodies, called functions) are not re-clammed.
   |=  [b=(list stmt) env=scope va=(list value) s=store]
   ^-  [flow store]
+  =/  whole  b
   |-  ^-  [flow store]
   ?~  b  [[%norm ~] s]
   =/  st  i.b
@@ -1123,35 +1205,60 @@
   ::
       %break  [[%brk ~] s]
   ::
+      %label  $(b t.b)
+  ::
+      %goto
+    =/  tgt  (find-label whole name.st)
+    ?~  tgt  [[%goto name.st] s]
+    $(b u.tgt)
+  ::
       %do
     =/  res  (do-stmts ;;((list stmt) body.st) env va s)
-    ?.  ?=(%norm -.-.res)  res
-    $(b t.b, s +.res)
+    ?:  ?=(%norm -.-.res)  $(b t.b, s +.res)
+    ?.  ?=(%goto -.-.res)  res
+    =/  tgt  (find-label whole name.-.res)
+    ?~  tgt  res
+    $(b u.tgt, s +.res)
   ::
       %while
     =/  res  (do-while c.st body.st env va s)
-    ?.  ?=(%norm -.-.res)  res
-    $(b t.b, s +.res)
+    ?:  ?=(%norm -.-.res)  $(b t.b, s +.res)
+    ?.  ?=(%goto -.-.res)  res
+    =/  tgt  (find-label whole name.-.res)
+    ?~  tgt  res
+    $(b u.tgt, s +.res)
   ::
       %repeat
     =/  res  (do-repeat body.st c.st env va s)
-    ?.  ?=(%norm -.-.res)  res
-    $(b t.b, s +.res)
+    ?:  ?=(%norm -.-.res)  $(b t.b, s +.res)
+    ?.  ?=(%goto -.-.res)  res
+    =/  tgt  (find-label whole name.-.res)
+    ?~  tgt  res
+    $(b u.tgt, s +.res)
   ::
       %if
     =/  res  (do-if clauses.st els.st env va s)
-    ?.  ?=(%norm -.-.res)  res
-    $(b t.b, s +.res)
+    ?:  ?=(%norm -.-.res)  $(b t.b, s +.res)
+    ?.  ?=(%goto -.-.res)  res
+    =/  tgt  (find-label whole name.-.res)
+    ?~  tgt  res
+    $(b u.tgt, s +.res)
   ::
       %numfor
     =/  res  (do-numfor st env va s)
-    ?.  ?=(%norm -.-.res)  res
-    $(b t.b, s +.res)
+    ?:  ?=(%norm -.-.res)  $(b t.b, s +.res)
+    ?.  ?=(%goto -.-.res)  res
+    =/  tgt  (find-label whole name.-.res)
+    ?~  tgt  res
+    $(b u.tgt, s +.res)
   ::
       %genfor
     =/  res  (do-genfor st env va s)
-    ?.  ?=(%norm -.-.res)  res
-    $(b t.b, s +.res)
+    ?:  ?=(%norm -.-.res)  $(b t.b, s +.res)
+    ?.  ?=(%goto -.-.res)  res
+    =/  tgt  (find-label whole name.-.res)
+    ?~  tgt  res
+    $(b u.tgt, s +.res)
   ==
 ++  bind-locals
   |=  [names=(list @t) vs=(list value) env=scope s=store]
@@ -1194,6 +1301,7 @@
   ?-  -.-.res
     %brk   [[%norm ~] +.res]
     %ret   res
+    %goto  res
     %norm  $(s +.res)
   ==
 ++  do-repeat
@@ -1205,6 +1313,7 @@
   ?-  -.-.res
     %brk   [[%norm ~] +.res]
     %ret   res
+    %goto  res
       %norm
     =/  s2  +.res
     =^  cv  s2  (ev c env va s2)
@@ -1220,11 +1329,96 @@
   =^  cv  s  (ev c.i.clauses env va s)
   ?:  (truthy cv)  (do-stmts ;;((list stmt) b.i.clauses) env va s)
   $(clauses t.clauses)
+::  loop-capture analysis: does a block/expr contain a %func (closure)?
+::  children are `*`, so clam each node back to its mold before matching.
+++  blk-has-func
+  |=  b=(list stmt)
+  ^-  ?
+  ?~  b  %.n
+  ?:  (stmt-has-func i.b)  %.y
+  $(b t.b)
+++  stmt-has-func
+  |=  st=stmt
+  ^-  ?
+  ?-  -.st
+      %local      (exprs-have-func exprs.st)
+      %localfunc  %.y
+      %assign     |((exprs-have-func targets.st) (exprs-have-func exprs.st))
+      %call       (expr-has-func e.st)
+      %do         (blk-has-func ;;((list stmt) body.st))
+      %while      |((expr-has-func c.st) (blk-has-func ;;((list stmt) body.st)))
+      %repeat     |((blk-has-func ;;((list stmt) body.st)) (expr-has-func c.st))
+      %if         (if-has-func clauses.st els.st)
+  ::
+      %numfor
+    ?|  (expr-has-func from.st)
+        (expr-has-func to.st)
+        ?~(step.st %.n (expr-has-func u.step.st))
+        (blk-has-func ;;((list stmt) body.st))
+    ==
+  ::
+      %genfor   |((exprs-have-func exprs.st) (blk-has-func ;;((list stmt) body.st)))
+      %return   (exprs-have-func exprs.st)
+      %label    %.n
+      %goto     %.n
+      %break    %.n
+  ==
+++  if-has-func
+  |=  [clauses=(list [c=* b=*]) els=(unit *)]
+  ^-  ?
+  ?:  ?&(?=(^ els) (blk-has-func ;;((list stmt) u.els)))  %.y
+  |-  ^-  ?
+  ?~  clauses  %.n
+  ?:  (expr-has-func c.i.clauses)  %.y
+  ?:  (blk-has-func ;;((list stmt) b.i.clauses))  %.y
+  $(clauses t.clauses)
+++  exprs-have-func
+  |=  es=(list *)
+  ^-  ?
+  ?~  es  %.n
+  ?:  (expr-has-func i.es)  %.y
+  $(es t.es)
+++  fields-have-func
+  |=  fs=(list *)
+  ^-  ?
+  ?~  fs  %.n
+  =/  f  ;;(tfield i.fs)
+  =/  hit=?
+    ?-  -.f
+      %pos   (expr-has-func v.f)
+      %key   |((expr-has-func k.f) (expr-has-func v.f))
+      %name  (expr-has-func v.f)
+    ==
+  ?:  hit  %.y
+  $(fs t.fs)
+++  expr-has-func
+  |=  ex=*
+  ^-  ?
+  =/  e  ;;(expr ex)
+  ?-  -.e
+    %nil     %.n
+    %true    %.n
+    %false   %.n
+    %int     %.n
+    %flt     %.n
+    %str     %.n
+    %vararg  %.n
+    %name    %.n
+    %paren   (expr-has-func e.e)
+    %index   |((expr-has-func t.e) (expr-has-func k.e))
+    %call    |((expr-has-func f.e) (exprs-have-func args.e))
+    %method  |((expr-has-func o.e) (exprs-have-func args.e))
+    %func    %.y
+    %table   (fields-have-func fields.e)
+    %binop   |((expr-has-func l.e) (expr-has-func r.e))
+    %unop    (expr-has-func e.e)
+  ==
 ++  do-numfor
   |=  [st=stmt env=scope va=(list value) s=store]
   ^-  [flow store]
   ?>  ?=(%numfor -.st)
   =/  body  ;;((list stmt) body.st)
+  =/  cap   (blk-has-func body)
   =^  fromv  s  (ev from.st env va s)
   =^  tov  s  (ev to.st env va s)
   =^  stepv  s  ?~(step.st [`value`[%i --1] s] (ev u.step.st env va s))
@@ -1233,8 +1427,19 @@
     =/  lim=@sd  p.tov
     =/  stp=@sd  p.stepv
     =/  up=?  (syn:si stp)
-    ::  allocate the loop variable's cell ONCE, then mutate it each
-    ::  iteration (avoids growing the store by one cell per iteration)
+    ::  Lua 5.4: fresh cell per iteration only when the body may capture the
+    ::  loop var in a closure; otherwise reuse one cell (bounded store).
+    ?:  cap
+      |-  ^-  [flow store]
+      ?.  ?:(up (sle i lim) (sge i lim))  [[%norm ~] s]
+      =^  env2  s  (decl v.st [%i i] env s)
+      =/  res  (do-stmts body env2 va s)
+      ?-  -.-.res
+        %brk   [[%norm ~] +.res]
+        %ret   res
+        %goto  res
+        %norm  $(i (sum:si i stp), s +.res)
+      ==
     =^  env2  s  (decl v.st [%i i] env s)
     |-  ^-  [flow store]
     ?.  ?:(up (sle i lim) (sge i lim))  [[%norm ~] s]
@@ -1243,12 +1448,24 @@
     ?-  -.-.res
       %brk   [[%norm ~] +.res]
       %ret   res
+      %goto  res
       %norm  $(i (sum:si i stp), s +.res)
     ==
   =/  x=@rd  (toflt (as-num fromv))
   =/  lim=@rd  (toflt (as-num tov))
   =/  stp=@rd  (toflt (as-num stepv))
   =/  up=?  !(lth:rd stp .~0)
+  ?:  cap
+    |-  ^-  [flow store]
+    ?.  ?:(up (rlte x lim) (rgte x lim))  [[%norm ~] s]
+    =^  env2  s  (decl v.st [%f x] env s)
+    =/  res  (do-stmts body env2 va s)
+    ?-  -.-.res
+      %brk   [[%norm ~] +.res]
+      %ret   res
+      %goto  res
+      %norm  $(x (add:rd x stp), s +.res)
+    ==
   =^  env2  s  (decl v.st [%f x] env s)
   |-  ^-  [flow store]
   ?.  ?:(up (rlte x lim) (rgte x lim))  [[%norm ~] s]
@@ -1257,6 +1474,7 @@
   ?-  -.-.res
     %brk   [[%norm ~] +.res]
     %ret   res
+    %goto  res
     %norm  $(x (add:rd x stp), s +.res)
   ==
 ++  do-genfor
@@ -1264,11 +1482,26 @@
   ^-  [flow store]
   ?>  ?=(%genfor -.st)
   =/  body  ;;((list stmt) body.st)
+  =/  cap   (blk-has-func body)
   =^  vals  s  (evl exprs.st env va s)
   =/  f  (arg 0 vals)
   =/  st8  (arg 1 vals)
   =/  ctrl  (arg 2 vals)
-  ::  allocate the loop variables' cells ONCE, then mutate each iteration
+  ?:  cap
+    ::  Lua 5.4: rebind the loop vars from the outer scope each iteration.
+    |-  ^-  [flow store]
+    =^  rets  s  (apply f ~[st8 ctrl] s)
+    =/  first  ?~(rets [%nil ~] i.rets)
+    ?:  ?=(%nil -.first)  [[%norm ~] s]
+    =.  ctrl  first
+    =^  env2  s  (bind-locals names.st rets env s)
+    =/  res  (do-stmts body env2 va s)
+    ?-  -.-.res
+      %brk   [[%norm ~] +.res]
+      %ret   res
+      %goto  res
+      %norm  $(s +.res)
+    ==
   =^  env2  s  (bind-locals names.st `(list value)`~ env s)
   |-  ^-  [flow store]
   =^  rets  s  (apply f ~[st8 ctrl] s)
@@ -1280,6 +1513,7 @@
   ?-  -.-.res
     %brk   [[%norm ~] +.res]
     %ret   res
+    %goto  res
     %norm  $(s +.res)
   ==
 ::                                                ::  ::  builtins
@@ -1475,6 +1709,221 @@
   |-  ^-  value
   ?:  =(n 0)  [%s (crip acc)]
   $(acc (weld str acc), n (dec n))
+++  read-flags
+  |=  t=tape
+  ^-  [m=? p=? sp=? h=? z=? t=tape]
+  =/  m=?  %.n
+  =/  p=?  %.n
+  =/  sp=?  %.n
+  =/  h=?  %.n
+  =/  z=?  %.n
+  |-  ^-  [m=? p=? sp=? h=? z=? t=tape]
+  ?~  t  [m p sp h z t]
+  ?:  =(i.t '-')  $(m %.y, t t.t)
+  ?:  =(i.t '+')  $(p %.y, t t.t)
+  ?:  =(i.t ' ')  $(sp %.y, t t.t)
+  ?:  =(i.t '#')  $(h %.y, t t.t)
+  ?:  =(i.t '0')  $(z %.y, t t.t)
+  [m p sp h z t]
+++  read-spec
+  |=  t=tape
+  ^-  [spec=fspec rest=tape]
+  =/  fl  (read-flags t)
+  =.  t  t.fl
+  =/  wd  (take-while t dig)
+  =/  width=@ud  ?~(p.wd 0 (base-val 10 p.wd))
+  =.  t  q.wd
+  =/  prec=(unit @ud)  ~
+  =^  prec  t
+    ?:  &(?=(^ t) =(i.t '.'))
+      =/  pd  (take-while t.t dig)
+      [`(base-val 10 p.pd) q.pd]
+    [~ t]
+  ?~  t  ~|(%lua-bad-format !!)
+  [[m.fl p.fl sp.fl h.fl z.fl width prec i.t] t.t]
+++  digit-char
+  |=  [d=@ upper=?]
+  ^-  @
+  ?:  (lth d 10)  (add '0' d)
+  ?:(upper (add 'A' (sub d 10)) (add 'a' (sub d 10)))
+++  to-base
+  |=  [n=@ud base=@ud upper=?]
+  ^-  tape
+  ?:  =(n 0)  "0"
+  =/  acc=tape  ~
+  |-  ^-  tape
+  ?:  =(n 0)  acc
+  $(acc [(digit-char (mod n base) upper) acc], n (div n base))
+++  as-u64
+  |=  i=@sd
+  ^-  @ud
+  ?:  (syn:si i)  (abs:si i)
+  (sub (bex 64) (abs:si i))
+++  find-char
+  |=  [t=tape c=@]
+  ^-  @ud
+  =/  i=@ud  0
+  |-  ^-  @ud
+  ?~  t  i
+  ?:  =(i.t c)  i
+  $(i +(i), t t.t)
+++  find-e
+  |=  t=tape
+  ^-  @ud
+  =/  i=@ud  0
+  |-  ^-  @ud
+  ?~  t  i
+  ?:  |(=(i.t 'e') =(i.t 'E'))  i
+  $(i +(i), t t.t)
+++  pad-str
+  |=  [t=tape width=@ud left=?]
+  ^-  tape
+  ?:  (gte (lent t) width)  t
+  =/  pad  (reap (sub width (lent t)) ' ')
+  ?:(left (weld t pad) (weld pad t))
+++  fmt-fixed
+  |=  [x=@rd prec=@ud]
+  ^-  tape
+  =/  scaled  (add:rd (mul:rd x (powten prec)) .~0.5)
+  =/  u  (toi:rd scaled)
+  =/  n=@ud  ?~(u 0 (abs:si u.u))
+  =/  ds  (to-base n 10 %.n)
+  ?:  =(prec 0)  ds
+  =?  ds  (lte (lent ds) prec)
+    (weld (reap (sub +(prec) (lent ds)) '0') ds)
+  =/  l  (lent ds)
+  (weld (scag (sub l prec) ds) (weld "." (slag (sub l prec) ds)))
+++  normsci
+  |=  [m=@rd e=@s]
+  ^-  [@rd @s]
+  ?:  (equ:rd m .~0)  [.~0 --0]
+  ?:  (rgte m .~10)  $(m (div:rd m .~10), e (sum:si e --1))
+  ?:  (lth:rd m .~1)  $(m (mul:rd m .~10), e (dif:si e --1))
+  [m e]
+++  fmt-exp
+  |=  [e=@s upper=?]
+  ^-  tape
+  =/  neg=?  =(-1 (cmp:si e --0))
+  =/  ds  (to-base (abs:si e) 10 %.n)
+  =?  ds  (lth (lent ds) 2)  (weld (reap (sub 2 (lent ds)) '0') ds)
+  (weld ~[?:(upper 'E' 'e') ?:(neg '-' '+')] ds)
+++  fmt-sci
+  |=  [x=@rd prec=@ud upper=?]
+  ^-  tape
+  ?:  (equ:rd x .~0)
+    (weld (fmt-fixed .~0 prec) (fmt-exp --0 upper))
+  =/  me  (normsci x --0)
+  =/  m  -.me
+  =/  e  +.me
+  =/  mt  (fmt-fixed m prec)
+  =^  mt  e
+    ?:  (gth (find-char mt '.') 1)
+      [(fmt-fixed (div:rd m .~10) prec) (sum:si e --1)]
+    [mt e]
+  (weld mt (fmt-exp e upper))
+++  strip-frac
+  |=  t=tape
+  ^-  tape
+  ?.  (lien t |=(c=@ =(c '.')))  t
+  =/  r  (flop t)
+  =.  r  |-(^-(tape ?~(r r ?:(=(i.r '0') $(r t.r) r))))
+  =.  r  ?~(r r ?:(=(i.r '.') t.r r))
+  (flop r)
+++  strip-zeros
+  |=  t=tape
+  ^-  tape
+  =/  ei  (find-e t)
+  (weld (strip-frac (scag ei t)) (slag ei t))
+++  fmt-gen
+  |=  [x=@rd prec=@ud upper=?]
+  ^-  tape
+  =/  p  ?:(=(prec 0) 1 prec)
+  ?:  (equ:rd x .~0)  "0"
+  =/  me  (normsci x --0)
+  =/  ex  +.me
+  =/  use-f=?  &((sge ex -4) =(-1 (cmp:si ex (sun:si p))))
+  =/  raw=tape
+    ?:  use-f
+      (fmt-fixed x (abs:si (dif:si (dif:si (sun:si p) --1) ex)))
+    (fmt-sci x (dec p) upper)
+  (strip-zeros raw)
+++  fmt-int-spec
+  |=  [sp=fspec v=value]
+  ^-  tape
+  =/  i  (as-int v)
+  =/  cv  conv.sp
+  =/  uns=?  ?!(|(=(cv 'd') =(cv 'i')))
+  =/  base=@ud  ?:(|(=(cv 'x') =(cv 'X')) 16 ?:(=(cv 'o') 8 10))
+  =/  upr=?  =(cv 'X')
+  =/  mag=@ud  ?:(uns (as-u64 i) (abs:si i))
+  =/  ds=tape  (to-base mag base upr)
+  =?  ds  ?=(^ prec.sp)
+    ?:  &(=(u.prec.sp 0) =(mag 0))  ~
+    ?:  (gte (lent ds) u.prec.sp)  ds
+    (weld (reap (sub u.prec.sp (lent ds)) '0') ds)
+  =/  sign=tape
+    ?:  uns  ~
+    ?:  !(syn:si i)  "-"
+    ?:  fp.sp  "+"
+    ?:  fsp.sp  " "
+    ~
+  =/  pfx=tape
+    ?.  fh.sp  ~
+    ?:  =(mag 0)  ~
+    ?:  =(cv 'o')  "0"
+    ?:  =(cv 'x')  "0x"
+    ?:  =(cv 'X')  "0X"
+    ~
+  =/  body  (weld sign (weld pfx ds))
+  =/  w  width.sp
+  ?:  (gte (lent body) w)  body
+  =/  np  (sub w (lent body))
+  ?:  fm.sp  (weld body (reap np ' '))
+  ?:  &(fz.sp ?=(~ prec.sp))
+    (weld sign (weld pfx (weld (reap np '0') ds)))
+  (weld (reap np ' ') body)
+++  fmt-flt-spec
+  |=  [sp=fspec v=value]
+  ^-  tape
+  =/  x0  (toflt (as-num v))
+  =/  neg=?  (lth:rd x0 .~0)
+  =/  x  ?:(neg (sub:rd .~0 x0) x0)
+  =/  cv  conv.sp
+  =/  prec  ?~(prec.sp 6 u.prec.sp)
+  =/  digits=tape
+    ?:  |(=(cv 'e') =(cv 'E'))  (fmt-sci x prec =(cv 'E'))
+    ?:  |(=(cv 'g') =(cv 'G'))  (fmt-gen x prec =(cv 'G'))
+    (fmt-fixed x prec)
+  =/  sign=tape
+    ?:  neg  "-"
+    ?:  fp.sp  "+"
+    ?:  fsp.sp  " "
+    ~
+  =/  body  (weld sign digits)
+  =/  w  width.sp
+  ?:  (gte (lent body) w)  body
+  =/  np  (sub w (lent body))
+  ?:  fm.sp  (weld body (reap np ' '))
+  ?:  fz.sp  (weld sign (weld (reap np '0') digits))
+  (weld (reap np ' ') body)
+++  quote-str
+  |=  c=@t
+  ^-  tape
+  =/  t  (trip c)
+  =/  bs=@  92
+  =/  acc=tape  ~
+  =.  acc
+    |-  ^-  tape
+    ?~  t  acc
+    =/  e=tape
+      ?:  =(i.t '"')   ~[bs '"']
+      ?:  =(i.t bs)    ~[bs bs]
+      ?:  =(i.t 10)    ~[bs 'n']
+      ?:  =(i.t 13)    ~[bs 'r']
+      ?:  =(i.t 0)     ~[bs '0']
+      ~[i.t]
+    $(acc (weld acc e), t t.t)
+  (weld ~['"'] (weld acc ~['"']))
 ++  bi-sformat
   |=  [args=(list value) s=store]
   ^-  value
@@ -1484,18 +1933,28 @@
   |-  ^-  value
   ?~  fmt  [%s (crip (flop acc))]
   ?.  =(i.fmt '%')  $(acc [i.fmt acc], fmt t.fmt)
-  ?~  t.fmt  $(acc [i.fmt acc], fmt t.fmt)
-  =/  spec  i.t.fmt
-  ?:  =(spec '%')  $(acc ['%' acc], fmt t.t.fmt)
+  ?~  t.fmt  ~|(%lua-bad-format !!)
+  ?:  =(i.t.fmt '%')  $(acc ['%' acc], fmt t.t.fmt)
+  =/  rs  (read-spec t.fmt)
+  =/  sp  spec.rs
+  =/  cv  conv.sp
   =/  a  ?~(rest [%nil ~] i.rest)
   =/  rest2  ?~(rest ~ t.rest)
   =/  piece=tape
-    ?:  |(=(spec 'd') =(spec 'i'))  (fmt-int (as-int a))
-    ?:  =(spec 's')  (tostr a s)
-    ?:  |(=(spec 'f') =(spec 'g'))  (fmt-flt (toflt (as-num a)))
-    ?:  =(spec 'x')  (slag 2 (scow %ux (abs:si (as-int a))))
-    ~[spec]
-  $(acc (weld (flop piece) acc), fmt t.t.fmt, rest rest2)
+    ?:  ?|(=(cv 'd') =(cv 'i') =(cv 'u') =(cv 'o') =(cv 'x') =(cv 'X'))
+      (fmt-int-spec sp a)
+    ?:  ?|(=(cv 'f') =(cv 'F') =(cv 'e') =(cv 'E') =(cv 'g') =(cv 'G'))
+      (fmt-flt-spec sp a)
+    ?:  =(cv 's')
+      =/  ts  (tostr a s)
+      =.  ts  ?~(prec.sp ts (scag u.prec.sp ts))
+      (pad-str ts width.sp fm.sp)
+    ?:  =(cv 'q')  (quote-str (as-str a))
+    ?:  =(cv 'c')
+      =/  ch=@  (abs:si (as-int a))
+      (pad-str ~[ch] width.sp fm.sp)
+    ~|([%lua-bad-format-spec cv] !!)
+  $(acc (weld (flop piece) acc), fmt rest.rs, rest rest2)
 ++  bi-tinsert
   |=  [args=(list value) s=store]
   ^-  [(list value) store]
