@@ -142,7 +142,7 @@ yield-free loop body inside a coroutine keeps tree-walker speed.
 
 Tree-walking interpreter over a functional store, interpreted through Nock — so
 expect scripting speeds, not LuaJIT. Timed with the runtime's own `~> %bout`
-hint on a fakeship (vere 3.2), wrapping `(run:lua src)`:
+hint on a fakeship, wrapping `(run:lua src)`:
 
 | benchmark                          |      work | wall time | per unit   |
 |------------------------------------|----------:|----------:|------------|
